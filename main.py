@@ -424,7 +424,7 @@ def test_gemini():
         return {"status": "error", "detail": "GEMINI_API_KEY non configurata"}
 
     import requests as req
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={api_key}"
     payload = {
         "contents": [{"parts": [{"text": "Rispondi solo con la parola: FUNZIONA"}]}],
         "generationConfig": {"maxOutputTokens": 10},
@@ -433,7 +433,7 @@ def test_gemini():
         resp = req.post(url, json=payload, timeout=15)
         if resp.status_code == 200:
             text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-            return {"status": "ok", "gemini_risponde": text.strip(), "model": "gemini-1.5-flash"}
+            return {"status": "ok", "gemini_risponde": text.strip(), "model": "gemini-2.0-flash-lite"}
         else:
             return {"status": "error", "http_status": resp.status_code, "detail": resp.text[:300]}
     except Exception as e:
