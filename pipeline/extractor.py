@@ -128,12 +128,14 @@ class LLMAdapter:
         model: str = "llama-3.1-70b-versatile",
         base_url: str = "http://localhost:11434",
         timeout: int = 90,
+        extra_base_url: str = "",   # sovrascrive ENDPOINTS[provider] se valorizzato
     ):
-        self.provider  = provider
-        self.api_key   = api_key
-        self.model     = model
-        self.base_url  = base_url
-        self.timeout   = timeout
+        self.provider       = provider
+        self.api_key        = api_key
+        self.model          = model
+        self.base_url       = base_url
+        self.timeout        = timeout
+        self.extra_base_url = extra_base_url
 
     @classmethod
     def for_gemini(cls, api_key: str, model: str = "gemini-2.0-flash-lite") -> "LLMAdapter":
@@ -173,7 +175,7 @@ class LLMAdapter:
             return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
 
     def _call_openai_compatible(self, system: str, user: str) -> str:
-        url = self.ENDPOINTS[self.provider]
+        url = self.extra_base_url if self.extra_base_url else self.ENDPOINTS[self.provider]
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
