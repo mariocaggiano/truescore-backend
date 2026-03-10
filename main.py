@@ -78,9 +78,17 @@ REPORTS_DIR.mkdir(exist_ok=True)
 # ─────────────────────────────────────────────
 
 def _get_llm() -> LLMAdapter:
-    """Restituisce il miglior LLM disponibile in base alle API key configurate.
-    Priorità: Gemini → Groq → OpenAI → Mock (solo dev)
+    """Restituisce il miglior LLM disponibile.
+    Priorità: Mistral → Gemini → Groq → OpenAI → Mock
     """
+    if os.getenv("MISTRAL_API_KEY"):
+        log.info("LLM: Mistral Large (mistral.ai)")
+        return LLMAdapter(
+            provider="openai",   # Mistral usa API OpenAI-compatible
+            api_key=os.getenv("MISTRAL_API_KEY"),
+            model="mistral-small-latest",
+            extra_base_url="https://api.mistral.ai/v1/chat/completions",
+        )
     if os.getenv("GEMINI_API_KEY"):
         log.info("LLM: Google Gemini 2.0 Flash (AI Studio)")
         return LLMAdapter.for_gemini(api_key=os.getenv("GEMINI_API_KEY"))
@@ -413,31 +421,42 @@ def download_report(job_id: str):
 #  Endpoint di diagnostica
 # ─────────────────────────────────────────────
 
-@app.get("/test-gemini")
-def test_gemini():
-    """
-    Testa la connessione a Gemini direttamente.
-    Visita /test-gemini nel browser per verificare che la chiave funzioni.
-    """
-    api_key = os.getenv("GEMINI_API_KEY", "")
-    if not api_key:
-        return {"status": "error", "detail": "GEMINI_API_KEY non configurata"}
-
+@app.get("/test-llm")
+def test_llm():
+    """Testa il LLM configurato. Visita /test-llm per verificare."""
     import requests as req
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={api_key}"
-    payload = {
-        "contents": [{"parts": [{"text": "Rispondi solo con la parola: FUNZIONA"}]}],
-        "generationConfig": {"maxOutputTokens": 10},
-    }
-    try:
-        resp = req.post(url, json=payload, timeout=15)
-        if resp.status_code == 200:
-            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-            return {"status": "ok", "gemini_risponde": text.strip(), "model": "gemini-2.0-flash-lite"}
-        else:
-            return {"status": "error", "http_status": resp.status_code, "detail": resp.text[:300]}
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
+
+    # Mistral
+    if os.getenv("MISTRAL_API_KEY"):
+        try:
+            resp = req.post(
+                "https://api.mistral.ai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {os.getenv('MISTRAL_API_KEY')}"},
+                json={"model": "mistral-small-latest", "messages": [{"role": "user", "content": "Rispondi solo: FUNZIONA"}], "max_tokens": 10},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                return {"status": "ok", "provider": "Mistral", "risposta": resp.json()["choices"][0]["message"]["content"].strip()}
+            return {"status": "error", "provider": "Mistral", "http": resp.status_code, "detail": resp.text[:200]}
+        except Exception as e:
+            return {"status": "error", "provider": "Mistral", "detail": str(e)}
+
+    # Gemini
+    if os.getenv("GEMINI_API_KEY"):
+        try:
+            key = os.getenv("GEMINI_API_KEY")
+            resp = req.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={key}",
+                json={"contents": [{"parts": [{"text": "Rispondi solo: FUNZIONA"}]}], "generationConfig": {"maxOutputTokens": 10}},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                return {"status": "ok", "provider": "Gemini", "risposta": resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()}
+            return {"status": "error", "provider": "Gemini", "http": resp.status_code, "detail": resp.text[:200]}
+        except Exception as e:
+            return {"status": "error", "provider": "Gemini", "detail": str(e)}
+
+    return {"status": "error", "detail": "Nessuna API key configurata (MISTRAL_API_KEY o GEMINI_API_KEY)"}
 
 
 # ─────────────────────────────────────────────
