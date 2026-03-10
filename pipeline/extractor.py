@@ -136,7 +136,7 @@ class LLMAdapter:
         self.timeout   = timeout
 
     @classmethod
-    def for_gemini(cls, api_key: str, model: str = "gemini-1.5-flash") -> "LLMAdapter":
+    def for_gemini(cls, api_key: str, model: str = "gemini-2.0-flash-lite") -> "LLMAdapter":
         """Usa API nativa Gemini — 15 req/min gratis, più stabile."""
         return cls(provider="gemini", api_key=api_key, model=model)
 
