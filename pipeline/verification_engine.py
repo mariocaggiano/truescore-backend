@@ -73,6 +73,7 @@ class ClaimVerdict:
     magnitude: float                 # 0–1: entità dello scarto dichiarato/verificato
     reasoning: str                   # spiegazione in linguaggio naturale
     sources_used: list[str]          = field(default_factory=list)
+    sources_consulted: list[str]     = field(default_factory=list)  # tutte le fonti tentate, anche senza risultati
     flags: list[str]                 = field(default_factory=list)
     notes: str                       = ""
 
@@ -310,15 +311,17 @@ class RevenueVerifier(BaseVerifier):
                     )
 
         # ── Nessuna fonte disponibile ─────────────────────────────────────
+        consulted = ["bilancio_infocamere", "linkedin_headcount"]
         return ClaimVerdict(
             claim_id=claim_id, claim_type=self.CLAIM_TYPE,
             claim_text=claim_text,
             declared_value=declared, verified_value=None,
             verdict=Verdict.INSUFFICIENT_DATA,
             evidence_confidence=0.0, magnitude=0.0,
-            reasoning="Nessuna fonte disponibile per verificare i ricavi. "
-                      "Caricare il bilancio Infocamere per una verifica diretta.",
-            sources_used=[], flags=["bilancio_mancante"],
+            reasoning="Nessuna fonte ha restituito dati sui ricavi. "
+                      "Per una verifica diretta caricare il bilancio Infocamere.",
+            sources_used=[], sources_consulted=consulted,
+            flags=["bilancio_mancante"],
         )
 
     def _sector_benchmark(self, sector: str) -> float:
@@ -451,8 +454,8 @@ class PartnerCountVerifier(BaseVerifier):
             declared_value=declared, verified_value=None,
             verdict=Verdict.INSUFFICIENT_DATA,
             evidence_confidence=0.0, magnitude=0.0,
-            reasoning="Nessuna fonte disponibile per verificare il numero di strutture partner.",
-            sources_used=[],
+            reasoning="Nessuna fonte ha restituito dati sul numero di strutture partner.",
+            sources_used=[], sources_consulted=["openstreetmap_overpass", "wayback_machine"],
         )
 
     @staticmethod
@@ -515,8 +518,8 @@ class FundingVerifier(BaseVerifier):
                 declared_value=declared, verified_value=None,
                 verdict=Verdict.INSUFFICIENT_DATA,
                 evidence_confidence=0.0, magnitude=0.0,
-                reasoning="Nessun dato Crunchbase disponibile.",
-                sources_used=[],
+                reasoning="Nessuna fonte ha restituito dati sul funding.",
+                sources_used=[], sources_consulted=["crunchbase", "news_scraping"],
             )
 
         sources.append("crunchbase")
@@ -666,8 +669,8 @@ class TeamSizeVerifier(BaseVerifier):
                 declared_value=declared, verified_value=None,
                 verdict=Verdict.INSUFFICIENT_DATA,
                 evidence_confidence=0.0, magnitude=0.0,
-                reasoning="Profilo LinkedIn non trovato.",
-                sources_used=[],
+                reasoning="Profilo LinkedIn non trovato o non accessibile.",
+                sources_used=[], sources_consulted=["linkedin"],
             )
 
         sources.append("linkedin")
@@ -737,8 +740,8 @@ class OtherVerifier(BaseVerifier):
             declared_value=None, verified_value=None,
             verdict=Verdict.INSUFFICIENT_DATA,
             evidence_confidence=0.0, magnitude=0.0,
-            reasoning="Tipo di claim non gestito nella v1.",
-            sources_used=[],
+            reasoning="Tipo di claim non gestito nella v1. Nessuna fonte consultata.",
+            sources_used=[], sources_consulted=[],
             flags=["fuori_scope_v1"],
         )
 
