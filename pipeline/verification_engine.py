@@ -842,35 +842,46 @@ class VerificationEngine:
     @staticmethod
     def _compute_trust_score(verdicts: list[ClaimVerdict]) -> float:
         """
-        Trust Score 0–10.
-        Formula: media ponderata dei verdict_score × evidence_confidence,
-        con pesi per tipo di claim.
+        Trust Score 0–10, calcolato SOLO sulle claim effettivamente verificate.
+
+        Logica:
+        - Le claim con INSUFFICIENT_DATA o UNCERTAIN non entrano nel calcolo
+          del punteggio: non sapere ≠ inaffidabile.
+        - Se la copertura verificabile è < 30% del peso totale possibile,
+          il sistema restituisce -1 (segnale speciale = "non valutabile").
+        - Il Trust Score riflette solo i verdict concreti (verified / warning /
+          discrepancy) pesati per tipo di claim e confidence.
         """
         if not verdicts:
-            return 5.0   # neutro se nessuna claim
+            return -1.0   # nessuna claim = non valutabile
 
-        weighted_sum  = 0.0
-        weight_total  = 0.0
+        # Separa claim verificabili da quelle senza dati
+        verifiable = [
+            v for v in verdicts
+            if v.verdict not in (Verdict.INSUFFICIENT_DATA, Verdict.UNCERTAIN)
+        ]
+        all_weight   = sum(CLAIM_TYPE_WEIGHTS.get(v.claim_type, 0.05) for v in verdicts)
+        verif_weight = sum(CLAIM_TYPE_WEIGHTS.get(v.claim_type, 0.05) for v in verifiable)
 
-        for v in verdicts:
+        # Copertura insufficiente → non valutabile
+        coverage = verif_weight / all_weight if all_weight > 0 else 0
+        if coverage < 0.30 or not verifiable:
+            return -1.0
+
+        weighted_sum = 0.0
+        weight_total = 0.0
+        for v in verifiable:
             w = CLAIM_TYPE_WEIGHTS.get(v.claim_type, 0.05)
-            # Penalizza i dati insufficienti dimezzando il peso
-            # (non sapere non è lo stesso che essere verificati)
-            if v.verdict == Verdict.INSUFFICIENT_DATA:
-                w *= 0.5
             score = v.verdict_score * v.evidence_confidence
-            weighted_sum  += w * score
-            weight_total  += w
+            weighted_sum += w * score
+            weight_total += w
 
-        if weight_total == 0:
-            return 5.0
-
-        raw = weighted_sum / weight_total
-        # Scala 0–1 → 0–10, con floor a 0.5 e cap a 9.5
+        raw = weighted_sum / weight_total if weight_total > 0 else 0
         return round(max(0.5, min(9.5, raw * 10)), 1)
 
     @staticmethod
     def _trust_label(score: float) -> str:
+        if score < 0:     return "Dati insufficienti per una valutazione"
         if score >= 7.5:  return "Alta affidabilità"
         if score >= 5.5:  return "Affidabilità moderata"
         if score >= 3.5:  return "Bassa affidabilità"
