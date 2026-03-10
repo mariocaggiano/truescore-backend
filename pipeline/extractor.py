@@ -17,6 +17,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
+import time
 import pdfplumber
 import requests
 from bs4 import BeautifulSoup
@@ -178,12 +179,20 @@ class LLMAdapter:
                 {"role": "system", "content": system},
                 {"role": "user",   "content": user},
             ],
-            "temperature": 0.1,   # bassa temperatura = output più deterministico
+            "temperature": 0.1,
             "max_tokens": 2048,
         }
-        resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        delays = [5, 15, 30]
+        for attempt, delay in enumerate(delays + [None], start=1):
+            resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+            if resp.status_code == 429:
+                if delay is None:
+                    resp.raise_for_status()
+                log.warning(f"Rate limit 429 (tentativo {attempt}/{len(delays)+1}) — riprovo tra {delay}s...")
+                time.sleep(delay)
+                continue
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
 
     def _call_ollama(self, system: str, user: str) -> str:
         url = self.ENDPOINTS["ollama"].format(base_url=self.base_url)
