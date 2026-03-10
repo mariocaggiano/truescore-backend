@@ -410,6 +410,37 @@ def download_report(job_id: str):
 
 
 # ─────────────────────────────────────────────
+#  Endpoint di diagnostica
+# ─────────────────────────────────────────────
+
+@app.get("/test-gemini")
+def test_gemini():
+    """
+    Testa la connessione a Gemini direttamente.
+    Visita /test-gemini nel browser per verificare che la chiave funzioni.
+    """
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        return {"status": "error", "detail": "GEMINI_API_KEY non configurata"}
+
+    import requests as req
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    payload = {
+        "contents": [{"parts": [{"text": "Rispondi solo con la parola: FUNZIONA"}]}],
+        "generationConfig": {"maxOutputTokens": 10},
+    }
+    try:
+        resp = req.post(url, json=payload, timeout=15)
+        if resp.status_code == 200:
+            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            return {"status": "ok", "gemini_risponde": text.strip(), "model": "gemini-1.5-flash"}
+        else:
+            return {"status": "error", "http_status": resp.status_code, "detail": resp.text[:300]}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
+# ─────────────────────────────────────────────
 #  Entry point locale
 # ─────────────────────────────────────────────
 
