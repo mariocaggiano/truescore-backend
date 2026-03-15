@@ -559,7 +559,9 @@ class LinkedInConnector(BaseConnector):
                 notes="Risultato da cache"
             )
 
-        data = self._scrape_company_headcount(company_name)
+        # Usa URL LinkedIn diretto se fornito dall'utente — molto più affidabile
+        linkedin_url = claim.get("linkedin_url") or claim.get("_meta", {}).get("linkedin_url")
+        data = self._scrape_company_headcount(company_name, direct_url=linkedin_url)
 
         if data:
             self.cache.set(cache_key, json.dumps(data))
@@ -578,13 +580,19 @@ class LinkedInConnector(BaseConnector):
             confidence=0.0
         )
 
-    def _scrape_company_headcount(self, company_name: str) -> Optional[dict]:
+    def _scrape_company_headcount(self, company_name: str, direct_url: Optional[str] = None) -> Optional[dict]:
         """
         Strategia in due step:
-        1. Cerca il profilo aziendale su Google (più affidabile di cercare su LI direttamente)
-        2. Accede alla pagina pubblica e legge il headcount
+        1. Usa URL diretto se fornito dall'utente (priorità assoluta)
+        2. Altrimenti cerca il profilo aziendale su Google
+        3. Accede alla pagina pubblica e legge il headcount
         """
-        profile_url = self._find_linkedin_url(company_name)
+        if direct_url and "linkedin.com/company/" in direct_url:
+            # Normalizza: rimuovi trailing slash e parametri
+            profile_url = direct_url.split("?")[0].rstrip("/")
+            log.info(f"LinkedIn: uso URL diretto fornito dall'utente: {profile_url}")
+        else:
+            profile_url = self._find_linkedin_url(company_name)
         if not profile_url:
             return None
 
@@ -866,8 +874,12 @@ class DataCollector:
         financial_data: Optional[dict] = None,
         crunchbase_api_key: str = "",
         cache: Optional[InMemoryCache] = None,
+        linkedin_url: str = "",
+        vat_number: str = "",
     ):
         shared_cache = cache or InMemoryCache()
+        self.linkedin_url = linkedin_url.strip()
+        self.vat_number   = vat_number.strip()
 
         self.connectors: dict[str, BaseConnector] = {
             "bilancio":  BilancioConnector(financial_data=financial_data, cache=shared_cache),
@@ -895,6 +907,11 @@ class DataCollector:
                 "normalized_value": claim.normalized_value,
                 "website_url": website_url,
             }
+            # Inietta metadati utente nel claim_dict per i connettori
+            if self.linkedin_url:
+                claim_dict = {**claim_dict, "linkedin_url": self.linkedin_url}
+            if self.vat_number:
+                claim_dict = {**claim_dict, "vat_number": self.vat_number}
 
             claim_type = claim_dict.get("type", "other")
             connector_names = self.CLAIM_CONNECTOR_MAP.get(claim_type, [])
