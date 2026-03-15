@@ -883,62 +883,69 @@ class UfficioCameraleConnector(BaseConnector):
     def _find_page_url(self, vat_number: str, company_name: str) -> Optional[str]:
         """
         Trova l'URL della pagina aziendale su ufficiocamerale.it.
-        Strategia (in ordine):
-        1. URL diretto /{vat_number} — il più affidabile
-        2. URL diretto /cerca?piva={vat_number}
-        3. Ricerca Google come ultimo tentativo
+        URL reale: /{id_numerico}/{nome-slug} — trovato via form di ricerca.
+
+        Strategia:
+        1. POST al form /trova-azienda con la P.IVA
+        2. Ricerca Google come fallback
         """
-        # Tentativo 1: URL diretto con P.IVA
-        candidates = [
-            f"https://www.ufficiocamerale.it/{vat_number}",
-            f"https://www.ufficiocamerale.it/visura-camerale-gratuita/{vat_number}",
-            f"https://www.ufficiocamerale.it/cerca?piva={vat_number}",
-        ]
-        for direct in candidates:
-            try:
-                time.sleep(1.0)
-                r = self._get(direct)
-                if r.status_code == 200 and (vat_number in r.text or company_name.lower() in r.text.lower()):
-                    log.info(f"UfficioCamerale: trovata pagina diretta: {direct}")
-                    return direct
-            except Exception:
-                continue
-
-        # Tentativo 2: ricerca sul sito stesso
+        # Tentativo 1: form di ricerca interno /trova-azienda
         try:
-            search_url = f"https://www.ufficiocamerale.it/cerca?q={quote_plus(vat_number)}"
-            time.sleep(1.5)
-            r = self._get(search_url)
-            if r.status_code == 200:
-                soup = BeautifulSoup(r.text, "html.parser")
-                for a in soup.select("a[href]"):
-                    href = a.get("href", "")
-                    if vat_number in href or (
-                        "ufficiocamerale.it" in href
-                        and "/cerca" not in href
-                        and "/trova-azienda" not in href
-                        and len(href) > 30
-                    ):
-                        if href.startswith("/"):
-                            href = "https://www.ufficiocamerale.it" + href
-                        return href
+            time.sleep(self.REQUEST_DELAY)
+            # Prima GET per ottenere eventuali token CSRF
+            base = "https://www.ufficiocamerale.it/trova-azienda"
+            r = self._get(base, timeout=8)
+            # Prova ricerca via GET con parametro
+            for param in ["piva", "partita_iva", "cf", "q", "search"]:
+                try:
+                    search_url = f"{base}?{param}={vat_number}"
+                    r2 = self._get(search_url, timeout=8)
+                    if r2.status_code == 200 and vat_number in r2.text:
+                        soup2 = BeautifulSoup(r2.text, "html.parser")
+                        for a in soup2.select("a[href]"):
+                            href = a.get("href", "")
+                            full = href if href.startswith("http") else "https://www.ufficiocamerale.it" + href
+                            if (re.search(r"/\d+/", full)
+                                    and "trova-azienda" not in full
+                                    and "news" not in full
+                                    and "cerca-pec" not in full):
+                                log.info(f"UfficioCamerale: trovata via search form: {full}")
+                                return full
+                except Exception:
+                    continue
         except Exception as e:
-            log.debug(f"UfficioCamerale search page: {e}")
+            log.debug(f"UfficioCamerale form: {e}")
 
-        # Tentativo 3: Google (potrebbe essere bloccato da server)
+        # Tentativo 2: URL diretto con slug nome azienda derivato
         try:
+            slug = company_name.lower()
+            for ch in [" s.r.l.", " srl", " s.p.a.", " spa", " s.n.c.", " snc"]:
+                slug = slug.replace(ch, "")
+            slug = re.sub(r"[^a-z0-9]+", "-", slug).strip("-")
+            # Il sito usa ID numerico + slug — proviamo con Google per trovarlo
             query = f'site:ufficiocamerale.it "{vat_number}"'
             url   = f"{self.GOOGLE_SEARCH}{quote_plus(query)}"
-            resp  = self._get(url)
+            resp  = self._get(url, timeout=8)
             soup  = BeautifulSoup(resp.text, "html.parser")
             for a in soup.select("a[href]"):
                 href = a.get("href", "")
-                if "ufficiocamerale.it/" in href and "/trova-azienda" not in href:
-                    match = re.search(r"https?://www\.ufficiocamerale\.it/[^\s&'\"]+", href)
+                if "ufficiocamerale.it/" in href:
+                    match = re.search(r"https?://www[.]ufficiocamerale[.]it/[0-9]+/[^ &'\"]+", href)
+                    if match:
+                        log.info(f"UfficioCamerale: trovata via Google: {match.group(0)}")
+                        return match.group(0)
+            # Prova anche con il nome azienda
+            query2 = f'site:ufficiocamerale.it "{slug}"'
+            resp2  = self._get(f"{self.GOOGLE_SEARCH}{quote_plus(query2)}", timeout=8)
+            soup2  = BeautifulSoup(resp2.text, "html.parser")
+            for a in soup2.select("a[href]"):
+                href = a.get("href", "")
+                if "ufficiocamerale.it/" in href:
+                    match = re.search(r"https?://www[.]ufficiocamerale[.]it/[0-9]+/[^ &'\"]+", href)
                     if match:
                         return match.group(0)
         except Exception as e:
-            log.debug(f"UfficioCamerale Google: {e}")
+            log.debug(f"UfficioCamerale Google fallback: {e}")
 
         return None
 
@@ -1146,59 +1153,79 @@ class OpenCorporatesConnector(BaseConnector):
         return self._scrape_opencorporates(company_name)
 
     def _scrape_opencorporates(self, company_name: str) -> Optional[dict]:
-        """Fallback: scraping della pagina di ricerca pubblica di opencorporates.com"""
-        try:
-            time.sleep(self.REQUEST_DELAY)
-            url  = f"https://opencorporates.com/companies?q={quote_plus(company_name)}&jurisdiction_code=it&type=company"
-            resp = self._get(url)
-            if resp.status_code != 200:
-                return None
+        """
+        Fallback: scraping di opencorporates.com.
+        Prova più varianti del nome per trovare l'azienda italiana.
+        """
+        # Genera varianti del nome da cercare
+        variants = [company_name]
+        name_lower = company_name.lower()
+        # Aggiungi variante con forma giuridica
+        if "srl" not in name_lower and "s.r.l" not in name_lower:
+            variants.append(company_name + " srl")
+            variants.append(company_name + " s.r.l.")
+        if "spa" not in name_lower and "s.p.a" not in name_lower:
+            variants.append(company_name + " spa")
 
-            soup    = BeautifulSoup(resp.text, "html.parser")
-            results = soup.select("li.search-result")
-            if not results:
-                # Prova selettore alternativo
-                results = soup.select("ul.companies li, .company-result")
+        for variant in variants[:4]:
+            try:
+                time.sleep(self.REQUEST_DELAY)
+                url  = f"https://opencorporates.com/companies?q={quote_plus(variant)}&jurisdiction_code=it&type=company"
+                resp = self._get(url, timeout=10)
+                if resp.status_code != 200:
+                    continue
 
-            if not results:
-                return None
+                soup = BeautifulSoup(resp.text, "html.parser")
 
-            # Prendi il primo risultato
-            first = results[0]
-            link  = first.select_one("a[href*='/companies/it/']")
-            if not link:
-                return None
+                # Prova selettori multipli (il sito può cambiare layout)
+                links = (
+                    soup.select("a[href*='/companies/it/']") or
+                    soup.select("ul.companies a") or
+                    soup.select(".search-result a")
+                )
 
-            company_url = "https://opencorporates.com" + link["href"]
-            name        = link.get_text(strip=True)
+                for link in links[:5]:
+                    href = link.get("href", "")
+                    if "/companies/it/" not in href:
+                        continue
 
-            # Leggi lo stato dalla card
-            status_tag  = first.select_one(".status, .inactive, span.label")
-            inactive    = status_tag and "inactive" in (status_tag.get("class", []) + [status_tag.get_text(strip=True).lower()])
+                    company_url    = "https://opencorporates.com" + href if href.startswith("/") else href
+                    name           = link.get_text(strip=True)
+                    company_number = href.rstrip("/").split("/")[-1]
 
-            # Ottieni numero registro dall'URL (es. /companies/it/12345678)
-            company_number = link["href"].split("/")[-1]
+                    # Verifica che il nome sia ragionevolmente simile
+                    name_words = set(company_name.lower().split())
+                    found_words = set(name.lower().split())
+                    overlap = len(name_words & found_words) / max(len(name_words), 1)
+                    if overlap < 0.3:
+                        continue
 
-            return {
-                "name":               name,
-                "company_number":     company_number,
-                "jurisdiction_code":  "it",
-                "company_type":       "",
-                "incorporation_date": None,
-                "dissolution_date":   None,
-                "current_status":     "inactive" if inactive else "active",
-                "status_normalized":  "cessata" if inactive else "attiva",
-                "inactive":           inactive,
-                "registered_address": "",
-                "previous_names":     [],
-                "opencorporates_url": company_url,
-                "registry_url":       "",
-                "source":             "opencorporates_scraping",
-            }
+                    # Leggi stato dalla pagina della company
+                    inactive = "inactive" in resp.text.lower()
 
-        except Exception as e:
-            log.warning(f"OpenCorporates scraping error per '{company_name}': {e}")
-            return None
+                    log.info(f"OpenCorporates scraping: trovata '{name}' ({company_url})")
+                    return {
+                        "name":               name,
+                        "company_number":     company_number,
+                        "jurisdiction_code":  "it",
+                        "company_type":       "",
+                        "incorporation_date": None,
+                        "dissolution_date":   None,
+                        "current_status":     "inactive" if inactive else "active",
+                        "status_normalized":  "cessata" if inactive else "attiva",
+                        "inactive":           inactive,
+                        "registered_address": "",
+                        "previous_names":     [],
+                        "opencorporates_url": company_url,
+                        "registry_url":       "",
+                        "source":             "opencorporates_scraping",
+                    }
+
+            except Exception as e:
+                log.debug(f"OpenCorporates scraping variant '{variant}': {e}")
+                continue
+
+        return None
 
     def _pick_best_match(self, results: list, query: str) -> Optional[dict]:
         """Seleziona il risultato più pertinente dalla lista."""
