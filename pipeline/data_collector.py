@@ -221,141 +221,236 @@ class BilancioConnector(BaseConnector):
 
 
 # ─────────────────────────────────────────────
-#  Connettore 2 — Overpass / OpenStreetMap
+#  Connettore 2 — Partner Website Scraper
 # ─────────────────────────────────────────────
 
-class OverpassConnector(BaseConnector):
+class PartnerWebsiteConnector(BaseConnector):
     """
-    Verifica l'esistenza di strutture geografiche via OpenStreetMap.
-    Usa l'API Overpass (gratuita, no key richiesta).
+    Verifica le claim di tipo partner_count cercando evidenze reali di partnership.
+
+    Strategia multi-segnale (in ordine di affidabilità):
+
+    1. PAGINA PARTNER sul sito aziendale
+       Cerca URL tipo /partner, /clienti, /network, /ecosystem sul sito dichiarato.
+       Conta i nomi/loghi aziendali elencati — quello è il numero verificabile.
+
+    2. GOOGLE SEARCH PARTNERSHIP
+       Cerca "[azienda] partner accordo collaborazione" e conta quante aziende
+       terze confermano pubblicamente la relazione.
+       Ogni menzione da un dominio diverso da quello aziendale = +1 partner verificato.
+
+    3. CONFRONTO DICHIARATO vs TROVATO
+       Restituisce: partner_found (trovati), partner_declared (dichiarati),
+       partner_names (lista nomi se disponibili), evidence_urls.
     """
 
-    NAME = "overpass"
-    ENDPOINT = "https://overpass-api.de/api/interpreter"
-    REQUEST_DELAY = 2.0   # Overpass richiede più rispetto
-
-    # Mapping tipo_struttura → tag OSM
-    OSM_TAGS = {
-        "bike_sharing":    [('amenity', 'bicycle_rental'), ('amenity', 'bicycle_parking')],
-        "scooter":         [('amenity', 'scooter_rental')],
-        "car_sharing":     [('amenity', 'car_sharing')],
-        "charging_station":[('amenity', 'charging_station')],
-        "mobility_hub":    [('amenity', 'bicycle_rental'), ('amenity', 'car_sharing')],
-        "generic":         [('amenity', 'bicycle_rental')],
-    }
+    NAME          = "partner_website"
+    REQUEST_DELAY = 2.0
+    PARTNER_SLUGS = [
+        "/partner", "/partners", "/clienti", "/clients",
+        "/network", "/ecosystem", "/collaborazioni", "/brand-partner",
+        "/brand", "/aziende-partner", "/chi-usa", "/chi-lo-usa",
+        "/case-study", "/casi-studio",
+    ]
+    GOOGLE_SEARCH = "https://www.google.com/search?q="
 
     def fetch(self, claim: dict, company_name: str) -> ConnectorResult:
-        claim_id   = claim.get("id", "")
-        claim_type = claim.get("type", "")
+        claim_id    = claim.get("id", "")
+        claim_type  = claim.get("type", "")
+        website_url = claim.get("website_url", "").strip().rstrip("/")
 
         if claim_type != "partner_count":
             return ConnectorResult(
                 connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
-                found=False, notes="Overpass usato solo per claim partner_count"
+                found=False, notes="PartnerWebsite: usato solo per partner_count"
             )
 
-        declared_value = self._extract_number(claim.get("normalized_value") or claim.get("text", ""))
-        structure_type = self._infer_structure_type(claim.get("text", "") + " " + company_name)
-        country        = claim.get("country", "IT")
-
-        cache_key = self.cache.make_key(self.NAME, structure_type, country)
+        cache_key = self.cache.make_key(self.NAME, company_name)
         cached = self.cache.get(cache_key)
         if cached:
             data = json.loads(cached)
             return ConnectorResult(
                 connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
-                found=True, data=data, confidence=0.75,
-                source_url=self.ENDPOINT,
+                found=True, data=data, confidence=data.get("confidence", 0.6),
+                source_url=data.get("source_url", ""),
                 notes="Risultato da cache"
             )
 
-        tags = self.OSM_TAGS.get(structure_type, self.OSM_TAGS["generic"])
-        query = self._build_query(tags, country)
+        data = {}
+        signals = []
 
+        # ── Segnale 1: pagina partner sul sito ──────────────────────────
+        if website_url:
+            page_result = self._scrape_partner_page(website_url, company_name)
+            if page_result:
+                data.update(page_result)
+                signals.append(("website_partner_page", page_result.get("confidence", 0.7)))
+
+        # ── Segnale 2: Google search menzioni partnership ─────────────
+        google_result = self._google_partnership_search(company_name)
+        if google_result:
+            data.update(google_result)
+            signals.append(("google_partnership_mentions", google_result.get("confidence", 0.5)))
+
+        if not signals:
+            return ConnectorResult(
+                connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+                found=False,
+                notes=f"Nessuna evidenza di partnership trovata per '{company_name}'"
+            )
+
+        # Confidence finale = media pesata dei segnali trovati
+        conf = sum(c for _, c in signals) / len(signals)
+        data["confidence"] = round(conf, 2)
+        data["signals_found"] = [s for s, _ in signals]
+
+        self.cache.set(cache_key, json.dumps(data))
+        return ConnectorResult(
+            connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+            found=True, data=data, confidence=conf,
+            source_url=data.get("source_url", ""),
+            notes=f"Partner trovati: {data.get('partners_found', 0)} "
+                  f"(segnali: {', '.join(data['signals_found'])})"
+        )
+
+    def _scrape_partner_page(self, base_url: str, company_name: str) -> Optional[dict]:
+        """
+        Cerca una pagina partner/clienti sul sito aziendale e conta i partner elencati.
+        """
+        # Normalizza base_url
+        if not base_url.startswith("http"):
+            base_url = "https://" + base_url
+
+        for slug in self.PARTNER_SLUGS:
+            url = base_url + slug
+            try:
+                time.sleep(self.REQUEST_DELAY)
+                resp = self._get(url)
+                if resp.status_code != 200:
+                    continue
+
+                soup = BeautifulSoup(resp.text, "html.parser")
+                page_text = soup.get_text(" ", strip=True)
+
+                # Segnale debole: pagina troppo corta = non è una vera pagina partner
+                if len(page_text) < 200:
+                    continue
+
+                # Conta nomi aziendali: img[alt], titoli, link esterni
+                partner_names = self._extract_partner_names(soup, base_url)
+
+                if len(partner_names) >= 2:
+                    log.info(f"PartnerWebsite: trovata pagina partner a {url} "
+                             f"({len(partner_names)} partner)")
+                    return {
+                        "source":          "website_partner_page",
+                        "source_url":      url,
+                        "partners_found":  len(partner_names),
+                        "partner_names":   partner_names[:30],  # max 30 nomi
+                        "confidence":      0.75,
+                    }
+
+            except Exception as e:
+                log.debug(f"PartnerWebsite: {url} — {e}")
+                continue
+
+        return None
+
+    def _extract_partner_names(self, soup: "BeautifulSoup", base_url: str) -> list[str]:
+        """
+        Estrae nomi di partner da una pagina HTML.
+        Strategia: img[alt] con testo significativo + link esterni + heading list.
+        """
+        names = set()
+        domain = re.sub(r"https?://(?:www\.)?", "", base_url).split("/")[0]
+
+        # 1. Loghi partner: img con alt text aziendale
+        for img in soup.find_all("img", alt=True):
+            alt = img["alt"].strip()
+            if 3 < len(alt) < 60 and not any(
+                skip in alt.lower()
+                for skip in ["logo", "icon", "banner", "sfondo", "background",
+                             "home", "menu", "search", "freccia", "arrow"]
+            ):
+                names.add(alt)
+
+        # 2. Link esterni (partner che linkano al proprio sito)
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("http") and domain not in href:
+                link_text = a.get_text(strip=True)
+                if 3 < len(link_text) < 60:
+                    names.add(link_text)
+
+        # 3. Liste di nomi in elementi strutturati (ul/ol, grid di card)
+        for tag in soup.find_all(["li", "h3", "h4"]):
+            txt = tag.get_text(strip=True)
+            if 3 < len(txt) < 80 and not any(
+                skip in txt.lower()
+                for skip in ["scopri", "leggi", "clicca", "contatti",
+                             "cookie", "privacy", "home", "blog"]
+            ):
+                names.add(txt)
+
+        return list(names)
+
+    def _google_partnership_search(self, company_name: str) -> Optional[dict]:
+        """
+        Cerca su Google menzioni di partnership con aziende terze.
+        Conta quanti domini distinti (non aziendali) confermano relazioni.
+        """
         try:
-            resp = self._get(self.ENDPOINT, params={"data": query})
-            resp.raise_for_status()
-            osm_data = resp.json()
+            query = f'"{company_name}" partner accordo collaborazione clienti'
+            url   = f"{self.GOOGLE_SEARCH}{quote_plus(query)}&num=20"
+            time.sleep(self.REQUEST_DELAY)
+            resp  = self._get(url)
+            soup  = BeautifulSoup(resp.text, "html.parser")
 
-            elements = osm_data.get("elements", [])
-            count = len(elements)
+            company_slug = company_name.lower().replace(" ", "")
+            confirmed_partners = set()
+            evidence_urls      = []
 
-            # Campiona i primi 10 per cross-reference
-            sample = [
-                {
-                    "id": el.get("id"),
-                    "name": el.get("tags", {}).get("name", "senza nome"),
-                    "lat": el.get("lat") or el.get("center", {}).get("lat"),
-                    "lon": el.get("lon") or el.get("center", {}).get("lon"),
-                }
-                for el in elements[:10]
-            ]
+            for result in soup.select("div.g, div[data-sokoban-container]"):
+                # Titolo del risultato
+                title_tag = result.select_one("h3")
+                title = title_tag.get_text(strip=True) if title_tag else ""
 
-            data = {
-                "osm_count": count,
-                "declared_count": declared_value,
-                "structure_type": structure_type,
-                "sample": sample,
-                "country": country,
+                # URL del risultato
+                link = result.select_one("a[href]")
+                href = link["href"] if link else ""
+
+                # Snippet
+                snippet_tag = result.select_one("div.VwiC3b, span.aCOpRe")
+                snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
+
+                combined = (title + " " + snippet).lower()
+
+                # Conta solo se il dominio è terzo (non il sito dell'azienda)
+                if company_slug not in href.lower() and href.startswith("http"):
+                    if any(kw in combined for kw in
+                           ["partner", "accordo", "collabora", "client",
+                            "integrazion", "ecosystem", "annunci"]):
+                        domain = re.sub(r"https?://(?:www\.)?", "", href).split("/")[0]
+                        if domain and domain not in confirmed_partners:
+                            confirmed_partners.add(domain)
+                            evidence_urls.append({"url": href, "title": title[:80]})
+
+            if len(confirmed_partners) < 1:
+                return None
+
+            log.info(f"PartnerWebsite Google: {len(confirmed_partners)} "
+                     f"menzioni di partnership per '{company_name}'")
+            return {
+                "source":              "google_partnership_mentions",
+                "partners_found":      len(confirmed_partners),
+                "evidence_count":      len(confirmed_partners),
+                "evidence_urls":       evidence_urls[:10],
+                "confidence":          0.55,  # Google è indiretto — confidence moderata
             }
 
-            self.cache.set(cache_key, json.dumps(data))
-
-            # Confidence: OSM ha buona copertura in Italia ma non completa
-            confidence = 0.70 if country == "IT" else 0.55
-
-            return ConnectorResult(
-                connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
-                found=True, data=data, confidence=confidence,
-                source_url=self.ENDPOINT,
-                notes=f"Trovate {count} strutture '{structure_type}' in {country} su OSM"
-            )
-
         except Exception as e:
-            log.error(f"Overpass error: {e}")
-            return ConnectorResult(
-                connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
-                found=False, error=str(e), confidence=0.0
-            )
-
-    def _build_query(self, tags: list[tuple], country: str) -> str:
-        """Costruisce una query Overpass QL per i tag dati in un paese."""
-        country_code = country.lower()
-        filters = ""
-        for key, val in tags:
-            filters += f'  node["{key}"="{val}"](area.country);\n'
-            filters += f'  way["{key}"="{val}"](area.country);\n'
-
-        return f"""
-[out:json][timeout:30];
-area["ISO3166-1"="{country_code.upper()}"]["admin_level"="2"]->.country;
-(
-{filters}
-);
-out center count;
-"""
-
-    @staticmethod
-    def _extract_number(text: str) -> Optional[int]:
-        if not text:
+            log.warning(f"PartnerWebsite Google search error: {e}")
             return None
-        nums = re.findall(r"\d+", str(text))
-        return int(nums[0]) if nums else None
-
-    @staticmethod
-    def _infer_structure_type(text: str) -> str:
-        text_l = text.lower()
-        if any(w in text_l for w in ["bici", "bike", "ciclismo", "cycling"]):
-            return "bike_sharing"
-        if any(w in text_l for w in ["scooter", "monopattino"]):
-            return "scooter"
-        if any(w in text_l for w in ["car sharing", "auto"]):
-            return "car_sharing"
-        if any(w in text_l for w in ["ricarica", "charging", "colonnina"]):
-            return "charging_station"
-        if any(w in text_l for w in ["mobilità", "mobility", "hub"]):
-            return "mobility_hub"
-        return "generic"
 
 
 # ─────────────────────────────────────────────
@@ -1080,7 +1175,7 @@ class DataCollector:
     # Quale connettore gestisce quale tipo di claim
     CLAIM_CONNECTOR_MAP = {
         "revenue":       ["bilancio", "ufficiocamerale"],
-        "partner_count": ["overpass"],
+        "partner_count": ["partner_website"],
         "funding":       ["crunchbase"],
         "team_size":     ["linkedin", "ufficiocamerale"],
         "other":         [],
@@ -1103,7 +1198,7 @@ class DataCollector:
 
         self.connectors: dict[str, BaseConnector] = {
             "bilancio":        BilancioConnector(financial_data=financial_data, cache=shared_cache),
-            "overpass":        OverpassConnector(cache=shared_cache),
+            "partner_website": PartnerWebsiteConnector(cache=shared_cache),
             "crunchbase":      CrunchbaseConnector(api_key=crunchbase_api_key, cache=shared_cache),
             "linkedin":        LinkedInConnector(cache=shared_cache),
             "ufficiocamerale": UfficioCameraleConnector(cache=shared_cache),
