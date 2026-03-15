@@ -998,6 +998,175 @@ class UfficioCameraleConnector(BaseConnector):
         except Exception:
             return None
 
+
+# ─────────────────────────────────────────────
+#  Connettore 6 — OpenCorporates (API gratuita)
+# ─────────────────────────────────────────────
+
+class OpenCorporatesConnector(BaseConnector):
+    """
+    Recupera dati legali ufficiali da OpenCorporates.
+    API gratuita, no key richiesta per ricerche base.
+    Fonte: registri societari pubblici di 140+ giurisdizioni.
+
+    Restituisce:
+    - Stato attività (attiva / cessata / irregolare)
+    - Data costituzione e tipo societario
+    - Indirizzo legale registrato
+    - Eventuali nomi precedenti (flag se il nome è cambiato di recente)
+    - URL registro ufficiale
+    """
+
+    NAME     = "opencorporates"
+    BASE_URL = "https://api.opencorporates.com/v0.4"
+    REQUEST_DELAY = 2.0
+
+    # Claim per cui questo connettore è rilevante
+    RELEVANT_TYPES = {"revenue", "team_size", "funding", "partner_count"}
+
+    def fetch(self, claim: dict, company_name: str) -> ConnectorResult:
+        claim_id   = claim.get("id", "")
+        claim_type = claim.get("type", "")
+
+        # Esegui una volta sola per azienda — usa cache aggressiva
+        cache_key = self.cache.make_key(self.NAME, company_name)
+        cached = self.cache.get(cache_key)
+        if cached:
+            data = json.loads(cached)
+            if data:
+                return ConnectorResult(
+                    connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+                    found=True, data=data, confidence=0.90,
+                    source_url=data.get("opencorporates_url", ""),
+                    notes="Risultato da cache"
+                )
+            return ConnectorResult(
+                connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+                found=False, notes="Azienda non trovata (da cache)"
+            )
+
+        data = self._search_company(company_name)
+
+        if data:
+            self.cache.set(cache_key, json.dumps(data))
+            return ConnectorResult(
+                connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+                found=True, data=data, confidence=0.90,
+                source_url=data.get("opencorporates_url", ""),
+                notes=f"Trovata su OpenCorporates: {data.get('current_status', 'N/D')}"
+            )
+
+        # Scrivi un risultato vuoto in cache per evitare query ripetute
+        self.cache.set(cache_key, json.dumps({}))
+        return ConnectorResult(
+            connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+            found=False,
+            notes=f"Azienda '{company_name}' non trovata su OpenCorporates"
+        )
+
+    def _search_company(self, company_name: str) -> Optional[dict]:
+        """
+        Cerca l'azienda su OpenCorporates per giurisdizione IT.
+        Strategia: cerca per nome, prende il primo risultato attivo con match esatto.
+        """
+        try:
+            time.sleep(self.REQUEST_DELAY)
+            resp = self._get(
+                f"{self.BASE_URL}/companies/search",
+                params={
+                    "q":                company_name,
+                    "jurisdiction_code": "it",
+                    "per_page":         5,
+                    "order":            "score",
+                }
+            )
+            resp.raise_for_status()
+            results = resp.json().get("results", {}).get("companies", [])
+
+            if not results:
+                return None
+
+            # Seleziona il miglior match: preferisce aziende attive e nome simile
+            best = self._pick_best_match(results, company_name)
+            if not best:
+                return None
+
+            company = best.get("company", {})
+            return self._extract_data(company)
+
+        except Exception as e:
+            log.warning(f"OpenCorporates search error per '{company_name}': {e}")
+            return None
+
+    def _pick_best_match(self, results: list, query: str) -> Optional[dict]:
+        """Seleziona il risultato più pertinente dalla lista."""
+        query_lower = query.lower()
+
+        # Prima passa: cerca match esatto o molto vicino tra aziende attive
+        for item in results:
+            company = item.get("company", {})
+            name    = company.get("name", "").lower()
+            active  = not company.get("inactive", True)
+            if active and (query_lower in name or name in query_lower):
+                return item
+
+        # Seconda passa: prendi il primo risultato attivo
+        for item in results:
+            company = item.get("company", {})
+            if not company.get("inactive", True):
+                return item
+
+        # Fallback: primo risultato qualunque
+        return results[0] if results else None
+
+    def _extract_data(self, company: dict) -> dict:
+        """Normalizza i dati di una company OpenCorporates."""
+        # Stato
+        inactive         = company.get("inactive", False)
+        dissolution_date = company.get("dissolution_date")
+        current_status   = company.get("current_status", "")
+
+        if dissolution_date or inactive:
+            status_normalized = "cessata"
+        elif current_status and current_status.lower() in ("active", "attiva"):
+            status_normalized = "attiva"
+        elif current_status:
+            status_normalized = current_status.lower()
+        else:
+            status_normalized = "sconosciuto"
+
+        # Indirizzo
+        addr = company.get("registered_address") or {}
+        address_str = ", ".join(filter(None, [
+            addr.get("street_address"),
+            addr.get("locality"),
+            addr.get("postal_code"),
+            addr.get("country"),
+        ]))
+
+        # Nomi precedenti
+        previous_names = [
+            p.get("company_name", "")
+            for p in company.get("previous_names", [])
+        ]
+
+        return {
+            "name":               company.get("name", ""),
+            "company_number":     company.get("company_number", ""),
+            "jurisdiction_code":  company.get("jurisdiction_code", "it"),
+            "company_type":       company.get("company_type", ""),
+            "incorporation_date": company.get("incorporation_date"),
+            "dissolution_date":   dissolution_date,
+            "current_status":     current_status,
+            "status_normalized":  status_normalized,
+            "inactive":           inactive,
+            "registered_address": address_str,
+            "previous_names":     previous_names,
+            "opencorporates_url": company.get("opencorporates_url", ""),
+            "registry_url":       company.get("registry_url", ""),
+            "source":             "opencorporates",
+        }
+
 # ─────────────────────────────────────────────
 #  Connettore 5 — Wayback Machine
 # ─────────────────────────────────────────────
@@ -1181,8 +1350,8 @@ class DataCollector:
         "other":         [],
     }
 
-    # Per tutte le claim con website, aggiungiamo sempre Wayback
-    UNIVERSAL_CONNECTORS = ["wayback"]
+    # Per tutte le claim, aggiungiamo sempre Wayback e OpenCorporates
+    UNIVERSAL_CONNECTORS = ["wayback", "opencorporates"]
 
     def __init__(
         self,
@@ -1203,6 +1372,7 @@ class DataCollector:
             "linkedin":        LinkedInConnector(cache=shared_cache),
             "ufficiocamerale": UfficioCameraleConnector(cache=shared_cache),
             "wayback":         WaybackConnector(cache=shared_cache),
+            "opencorporates":  OpenCorporatesConnector(cache=shared_cache),
         }
 
     def collect(
