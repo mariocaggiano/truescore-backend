@@ -103,6 +103,7 @@ class VerificationResult:
     warnings_list: list[ClaimVerdict]= field(default_factory=list)
     unverifiable: list[ClaimVerdict] = field(default_factory=list)
     errors: list[str]                = field(default_factory=list)
+    legal_status: Optional[dict]     = None   # dati OpenCorporates
 
     def summary(self) -> str:
         lines = [
@@ -131,6 +132,7 @@ class VerificationResult:
             "red_flags": [v.claim_id for v in self.red_flags],
             "warnings": [v.claim_id for v in self.warnings_list],
             "unverifiable": [v.claim_id for v in self.unverifiable],
+            "legal_status": self.legal_status,
             "errors": self.errors,
         }
 
@@ -822,6 +824,119 @@ class TeamSizeVerifier(BaseVerifier):
         )
 
 
+class LegalStatusVerifier:
+    """
+    Non è un verifier di claim ma un modulo autonomo che
+    arricchisce il VerificationResult con i dati legali da OpenCorporates.
+
+    Produce la sezione "Stato Legale" del report con:
+    - Badge stato (Attiva / Cessata / Irregolare / Non trovata)
+    - Data costituzione, tipo societario, indirizzo
+    - Flag critici: azienda cessata, costituita da < 1 anno, cambio nome recente
+    """
+
+    @staticmethod
+    def enrich(result: "VerificationResult", raw_results: list[dict]) -> None:
+        """Popola result.legal_status dai dati OpenCorporates disponibili."""
+        oc_results = [
+            r for r in raw_results
+            if r.get("connector") == "opencorporates" and r.get("found")
+        ]
+
+        if not oc_results:
+            result.legal_status = {
+                "found": False,
+                "status_normalized": "non_trovata",
+                "status_label": "Non trovata su OpenCorporates",
+                "flags": [],
+                "source": "opencorporates",
+            }
+            return
+
+        data  = oc_results[0].get("data", {})
+        flags = []
+
+        # ── Flag critici ──────────────────────────────────────────────────
+        status = data.get("status_normalized", "sconosciuto")
+
+        if status == "cessata":
+            flags.append({
+                "severity": "critical",
+                "text": f"Azienda CESSATA"
+                        + (f" il {data['dissolution_date']}" if data.get("dissolution_date") else "")
+                        + ". Verificare se opera tramite altra entità.",
+            })
+
+        if data.get("incorporation_date"):
+            try:
+                from datetime import date
+                inc = date.fromisoformat(data["incorporation_date"])
+                age_days = (date.today() - inc).days
+                if age_days < 365:
+                    flags.append({
+                        "severity": "warning",
+                        "text": f"Azienda costituita da meno di un anno "
+                                f"({inc.strftime('%d/%m/%Y')}). "
+                                f"Storico operativo limitato.",
+                    })
+                elif age_days < 730:
+                    flags.append({
+                        "severity": "info",
+                        "text": f"Azienda costituita da meno di due anni "
+                                f"({inc.strftime('%d/%m/%Y')}).",
+                    })
+            except Exception:
+                pass
+
+        if data.get("previous_names"):
+            flags.append({
+                "severity": "warning",
+                "text": f"Nomi precedenti registrati: "
+                        f"{', '.join(data['previous_names'][:3])}. "
+                        f"Verificare continuità operativa.",
+            })
+
+        # Propaghiamo flag critici anche nei red_flags del report principale
+        for flag in flags:
+            if flag["severity"] == "critical":
+                result.red_flags.append(
+                    type("LegalFlag", (), {
+                        "claim_id": "LEGAL_STATUS",
+                        "claim_type": "legal_status",
+                        "verdict": type("V", (), {"value": "discrepancy"})(),
+                        "claim_text": flag["text"],
+                    })()
+                )
+
+        result.legal_status = {
+            "found":              True,
+            "name":               data.get("name", ""),
+            "company_number":     data.get("company_number", ""),
+            "company_type":       data.get("company_type", ""),
+            "incorporation_date": data.get("incorporation_date"),
+            "dissolution_date":   data.get("dissolution_date"),
+            "current_status":     data.get("current_status", ""),
+            "status_normalized":  status,
+            "status_label":       LegalStatusVerifier._status_label(status),
+            "registered_address": data.get("registered_address", ""),
+            "previous_names":     data.get("previous_names", []),
+            "opencorporates_url": data.get("opencorporates_url", ""),
+            "registry_url":       data.get("registry_url", ""),
+            "flags":              flags,
+            "source":             "opencorporates",
+        }
+
+    @staticmethod
+    def _status_label(status: str) -> str:
+        return {
+            "attiva":        "Attiva",
+            "cessata":       "Cessata",
+            "inattiva":      "Inattiva",
+            "sconosciuto":   "Stato sconosciuto",
+            "non_trovata":   "Non trovata",
+        }.get(status, status.title())
+
+
 class OtherVerifier(BaseVerifier):
     """Catch-all per tipi di claim non gestiti."""
 
@@ -929,6 +1044,9 @@ class VerificationEngine:
             v for v in result.verdicts
             if v.verdict in (Verdict.INSUFFICIENT_DATA, Verdict.UNCERTAIN)
         ]
+
+        # ── Arricchisci con dati legali OpenCorporates ───────────────────
+        LegalStatusVerifier.enrich(result, raw_results)
 
         # ── Calcola Trust Score ───────────────────────────────────────────
         result.trust_score = self._compute_trust_score(result.verdicts)
