@@ -1393,7 +1393,10 @@ class DataCollector:
                 "normalized_value": claim.normalized_value,
                 "website_url": website_url,
             }
-            # Inietta metadati utente nel claim_dict per i connettori
+            # Inietta sempre i metadati utente nel claim_dict per i connettori
+            # (website_url va iniettato anche se claim è già un dict)
+            if website_url:
+                claim_dict = {**claim_dict, "website_url": website_url}
             if self.linkedin_url:
                 claim_dict = {**claim_dict, "linkedin_url": self.linkedin_url}
             if self.vat_number:
