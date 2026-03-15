@@ -683,6 +683,226 @@ class LinkedInConnector(BaseConnector):
         return None
 
 
+
+# ─────────────────────────────────────────────
+#  Connettore 5b — Ufficio Camerale (scraping gratuito)
+# ─────────────────────────────────────────────
+
+class UfficioCameraleConnector(BaseConnector):
+    """
+    Recupera fatturato e dipendenti da ufficiocamerale.it.
+    Il sito espone gratuitamente dati da Registro Imprese / Infocamere.
+    Richiede la Partita IVA dell'azienda.
+
+    Strategia:
+    1. Cerca la pagina aziendale tramite Google (site:ufficiocamerale.it + P.IVA)
+    2. Scarica la pagina pubblica
+    3. Estrae fatturato, dipendenti, ATECO, stato attività
+    """
+
+    NAME         = "ufficiocamerale"
+    REQUEST_DELAY = 3.0
+    GOOGLE_SEARCH = "https://www.google.com/search?q="
+
+    def fetch(self, claim: dict, company_name: str) -> ConnectorResult:
+        claim_id   = claim.get("id", "")
+        claim_type = claim.get("type", "")
+        vat_number = claim.get("vat_number", "").strip()
+
+        # Utile per revenue e team_size; skip se P.IVA mancante
+        if claim_type not in ("revenue", "team_size"):
+            return ConnectorResult(
+                connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+                found=False, notes="UfficioCamerale: usato solo per revenue e team_size"
+            )
+
+        if not vat_number:
+            return ConnectorResult(
+                connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+                found=False, notes="UfficioCamerale: Partita IVA non fornita"
+            )
+
+        cache_key = self.cache.make_key(self.NAME, vat_number)
+        cached = self.cache.get(cache_key)
+        if cached:
+            data = json.loads(cached)
+            return ConnectorResult(
+                connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+                found=True, data=data, confidence=0.80,
+                source_url=data.get("page_url", ""),
+                notes="Risultato da cache"
+            )
+
+        data = self._scrape_company_data(vat_number, company_name)
+
+        if data:
+            self.cache.set(cache_key, json.dumps(data))
+            return ConnectorResult(
+                connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+                found=True, data=data, confidence=0.80,
+                source_url=data.get("page_url", ""),
+                notes="Dati da Registro Imprese via ufficiocamerale.it"
+            )
+
+        return ConnectorResult(
+            connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+            found=False,
+            notes=f"Azienda non trovata su ufficiocamerale.it (P.IVA: {vat_number})",
+            confidence=0.0
+        )
+
+    def _scrape_company_data(self, vat_number: str, company_name: str) -> Optional[dict]:
+        """Cerca la pagina su Google, poi la scrapa."""
+        page_url = self._find_page_url(vat_number, company_name)
+        if not page_url:
+            log.warning(f"UfficioCamerale: pagina non trovata per P.IVA {vat_number}")
+            return None
+
+        try:
+            time.sleep(self.REQUEST_DELAY)
+            resp = self._get(page_url)
+            soup = BeautifulSoup(resp.text, "html.parser")
+            return self._extract_data(soup, page_url, vat_number)
+        except Exception as e:
+            log.warning(f"UfficioCamerale scraping error: {e}")
+            return None
+
+    def _find_page_url(self, vat_number: str, company_name: str) -> Optional[str]:
+        """Trova l'URL della pagina aziendale via Google."""
+        try:
+            query = f'site:ufficiocamerale.it "{vat_number}"'
+            url   = f"{self.GOOGLE_SEARCH}{quote_plus(query)}"
+            resp  = self._get(url)
+            soup  = BeautifulSoup(resp.text, "html.parser")
+
+            for a in soup.select("a[href]"):
+                href = a.get("href", "")
+                if "ufficiocamerale.it/" in href and "/trova-azienda" not in href:
+                    # Estrai URL pulito dal redirect Google
+                    match = re.search(r"https?://www\.ufficiocamerale\.it/[^\s&'\"]+", href)
+                    if match:
+                        return match.group(0)
+
+            # Fallback: prova URL diretto con P.IVA come slug
+            direct = f"https://www.ufficiocamerale.it/{vat_number}"
+            try:
+                r = self._get(direct)
+                if r.status_code == 200 and vat_number in r.text:
+                    return direct
+            except Exception:
+                pass
+
+        except Exception as e:
+            log.warning(f"UfficioCamerale: errore ricerca Google: {e}")
+        return None
+
+    def _extract_data(self, soup: "BeautifulSoup", page_url: str, vat_number: str) -> Optional[dict]:
+        """Estrae fatturato, dipendenti e altri dati dalla pagina HTML."""
+        data = {
+            "vat_number": vat_number,
+            "page_url":   page_url,
+            "revenues":   None,
+            "employees":  None,
+            "ateco_code": None,
+            "company_status": None,
+            "legal_form": None,
+            "source":     "ufficiocamerale_scraping",
+        }
+
+        page_text = soup.get_text(" ", strip=True).lower()
+
+        # ── Fatturato ─────────────────────────────────────────────────────
+        for pattern in [
+            r"fatturato[:\s]+([€£]?\s*[\d\.,]+\s*(?:mln|miliard|milion|k|€)?)",
+            r"ricavi[:\s]+([€£]?\s*[\d\.,]+\s*(?:mln|miliard|milion|k|€)?)",
+            r"([\d\.,]+)\s*(?:mln|milioni).*?(?:fatturato|ricavi)",
+        ]:
+            m = re.search(pattern, page_text)
+            if m:
+                data["revenues"] = self._parse_revenue(m.group(1))
+                break
+
+        # Prova anche tag strutturati (tabelle, dt/dd)
+        if data["revenues"] is None:
+            for tag in soup.find_all(["td", "dd", "span", "div"]):
+                txt = tag.get_text(strip=True).lower()
+                if any(k in txt for k in ["fatturato", "ricavi"]):
+                    sib = tag.find_next_sibling()
+                    if sib:
+                        data["revenues"] = self._parse_revenue(sib.get_text(strip=True))
+                    if data["revenues"]:
+                        break
+
+        # ── Dipendenti ────────────────────────────────────────────────────
+        for pattern in [
+            r"dipendenti[:\s]+(\d[\d\.,]*)",
+            r"addetti[:\s]+(\d[\d\.,]*)",
+            r"(\d+)\s+dipendenti",
+        ]:
+            m = re.search(pattern, page_text)
+            if m:
+                try:
+                    data["employees"] = int(m.group(1).replace(".", "").replace(",", ""))
+                except Exception:
+                    pass
+                if data["employees"]:
+                    break
+
+        # Prova anche tag strutturati
+        if data["employees"] is None:
+            for tag in soup.find_all(["td", "dd", "span", "div"]):
+                txt = tag.get_text(strip=True).lower()
+                if any(k in txt for k in ["dipendenti", "addetti"]):
+                    sib = tag.find_next_sibling()
+                    if sib:
+                        try:
+                            data["employees"] = int(re.sub(r"[^\d]", "", sib.get_text(strip=True)) or "0") or None
+                        except Exception:
+                            pass
+                    if data["employees"]:
+                        break
+
+        # ── ATECO ─────────────────────────────────────────────────────────
+        m = re.search(r"ateco[:\s]+([0-9]{2}\.[0-9]{2}(?:\.[0-9]+)?)", page_text)
+        if m:
+            data["ateco_code"] = m.group(1)
+
+        # ── Stato attività ────────────────────────────────────────────────
+        if "attiva" in page_text:
+            data["company_status"] = "attiva"
+        elif "cessata" in page_text:
+            data["company_status"] = "cessata"
+        elif "inattiva" in page_text:
+            data["company_status"] = "inattiva"
+
+        # Considera valido se almeno uno dei dati principali è presente
+        if data["revenues"] or data["employees"]:
+            return data
+        return None
+
+    @staticmethod
+    def _parse_revenue(text: str) -> Optional[float]:
+        """Converte testo tipo '€1.2 mln' o '1.200.000' in float."""
+        if not text:
+            return None
+        text = text.lower().strip()
+        try:
+            # Gestisci moltiplicatori
+            if "mld" in text or "miliard" in text:
+                num = float(re.sub(r"[^\d,\.]", "", text).replace(",", "."))
+                return num * 1_000_000_000
+            if "mln" in text or "milion" in text:
+                num = float(re.sub(r"[^\d,\.]", "", text).replace(",", "."))
+                return num * 1_000_000
+            if "k" in text:
+                num = float(re.sub(r"[^\d,\.]", "", text).replace(",", "."))
+                return num * 1_000
+            # Numero semplice (es. 1.200.000 o 1,200,000)
+            clean = re.sub(r"[^\d]", "", text)
+            return float(clean) if clean else None
+        except Exception:
+            return None
+
 # ─────────────────────────────────────────────
 #  Connettore 5 — Wayback Machine
 # ─────────────────────────────────────────────
@@ -859,10 +1079,10 @@ class DataCollector:
 
     # Quale connettore gestisce quale tipo di claim
     CLAIM_CONNECTOR_MAP = {
-        "revenue":       ["bilancio"],
+        "revenue":       ["bilancio", "ufficiocamerale"],
         "partner_count": ["overpass"],
         "funding":       ["crunchbase"],
-        "team_size":     ["linkedin"],
+        "team_size":     ["linkedin", "ufficiocamerale"],
         "other":         [],
     }
 
@@ -882,11 +1102,12 @@ class DataCollector:
         self.vat_number   = vat_number.strip()
 
         self.connectors: dict[str, BaseConnector] = {
-            "bilancio":  BilancioConnector(financial_data=financial_data, cache=shared_cache),
-            "overpass":  OverpassConnector(cache=shared_cache),
-            "crunchbase": CrunchbaseConnector(api_key=crunchbase_api_key, cache=shared_cache),
-            "linkedin":  LinkedInConnector(cache=shared_cache),
-            "wayback":   WaybackConnector(cache=shared_cache),
+            "bilancio":        BilancioConnector(financial_data=financial_data, cache=shared_cache),
+            "overpass":        OverpassConnector(cache=shared_cache),
+            "crunchbase":      CrunchbaseConnector(api_key=crunchbase_api_key, cache=shared_cache),
+            "linkedin":        LinkedInConnector(cache=shared_cache),
+            "ufficiocamerale": UfficioCameraleConnector(cache=shared_cache),
+            "wayback":         WaybackConnector(cache=shared_cache),
         }
 
     def collect(
