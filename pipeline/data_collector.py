@@ -1343,10 +1343,10 @@ class DataCollector:
 
     # Quale connettore gestisce quale tipo di claim
     CLAIM_CONNECTOR_MAP = {
-        "revenue":       ["bilancio", "ufficiocamerale"],
+        "revenue":       ["bilancio"],        # ufficiocamerale aggiunto dinamicamente se P.IVA presente
         "partner_count": ["partner_website"],
         "funding":       ["crunchbase"],
-        "team_size":     ["linkedin", "ufficiocamerale"],
+        "team_size":     ["linkedin"],         # ufficiocamerale aggiunto dinamicamente se P.IVA presente
         "other":         [],
     }
 
@@ -1403,22 +1403,37 @@ class DataCollector:
                 claim_dict = {**claim_dict, "vat_number": self.vat_number}
 
             claim_type = claim_dict.get("type", "other")
-            connector_names = self.CLAIM_CONNECTOR_MAP.get(claim_type, [])
+            connector_names = list(self.CLAIM_CONNECTOR_MAP.get(claim_type, []))
 
-            # Aggiungi Wayback se c'è un sito
-            if website_url:
-                for uc in self.UNIVERSAL_CONNECTORS:
-                    if uc not in connector_names:
-                        connector_names = connector_names + [uc]
+            # Wayback: solo se c'è un sito web
+            if website_url and "wayback" not in connector_names:
+                connector_names.append("wayback")
 
+            # OpenCorporates: sempre (cerca per nome, non richiede altri input)
+            if "opencorporates" not in connector_names:
+                connector_names.append("opencorporates")
+
+            # UfficioCamerale: solo se c'è la P.IVA
+            if self.vat_number and "ufficiocamerale" not in connector_names:
+                if claim_type in ("revenue", "team_size"):
+                    connector_names.append("ufficiocamerale")
+
+            log.info(f"Connettori per [{claim_type}]: {connector_names}")
             for name in connector_names:
                 connector = self.connectors.get(name)
                 if not connector:
+                    log.warning(f"[{name}] Connettore non registrato — skip")
                     continue
 
                 log.info(f"[{name}] Fetching claim {claim_dict.get('id')} ({claim_type})")
-                result = connector.fetch(claim_dict, company_name)
-                collection.results.append(result)
+                try:
+                    result = connector.fetch(claim_dict, company_name)
+                    status = "✓ trovato" if result.found else f"✗ non trovato ({result.notes or ''})"
+                    log.info(f"[{name}] {status}")
+                    collection.results.append(result)
+                except Exception as e:
+                    log.error(f"[{name}] Errore fetch: {e}")
+                    collection.errors.append(f"{name}: {e}")
 
         log.info(f"Collection completata:\n{collection.summary()}")
         return collection
