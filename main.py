@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 # ── FastAPI + CORS ────────────────────────────────────────────────────────────
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTasks
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from dotenv import load_dotenv
@@ -136,6 +136,9 @@ async def run_pipeline(
     crunchbase_api_key: Optional[str],
     linkedin_url: str = "",
     vat_number: str = "",
+    ufficiocamerale_html: str = "",
+    ufficiocamerale_url: str = "",
+    opencorporates_html: str = "",
 ):
     try:
         _job_update(job_id, status="running", started_at=time.time())
@@ -172,12 +175,49 @@ async def run_pipeline(
         await asyncio.sleep(0.1)
 
         fin = extraction.financial_data
+        # Parsa HTML pre-fetchato dal browser se disponibile
+        uc_prefetched_data = None
+        oc_prefetched_data = None
+
+        if ufficiocamerale_html and vat_number:
+            try:
+                from data_collector import UfficioCameraleConnector
+                uc_conn = UfficioCameraleConnector(cache=InMemoryCache())
+                uc_prefetched_data = uc_conn.parse_html(
+                    ufficiocamerale_html,
+                    ufficiocamerale_url or "https://www.ufficiocamerale.it",
+                    vat_number
+                )
+                if uc_prefetched_data:
+                    log.info(f"[{job_id[:8]}] UfficioCamerale (client-fetch): "
+                             f"ricavi={uc_prefetched_data.get('revenues')}, "
+                             f"dipendenti={uc_prefetched_data.get('employees')}")
+            except Exception as e:
+                log.warning(f"[{job_id[:8]}] UfficioCamerale parse error: {e}")
+
+        if opencorporates_html:
+            try:
+                from data_collector import OpenCorporatesConnector
+                oc_conn = OpenCorporatesConnector(cache=InMemoryCache())
+                oc_prefetched_data = oc_conn.parse_html(
+                    opencorporates_html,
+                    "https://opencorporates.com/companies"
+                )
+                if oc_prefetched_data:
+                    log.info(f"[{job_id[:8]}] OpenCorporates (client-fetch): "
+                             f"{oc_prefetched_data.get('name')} — "
+                             f"{oc_prefetched_data.get('status_normalized')}")
+            except Exception as e:
+                log.warning(f"[{job_id[:8]}] OpenCorporates parse error: {e}")
+
         collector = DataCollector(
             financial_data=fin.__dict__ if fin else None,
             crunchbase_api_key=crunchbase_api_key or "",
             cache=InMemoryCache(),
             linkedin_url=linkedin_url,
             vat_number=vat_number,
+            uc_prefetched=uc_prefetched_data,
+            oc_prefetched=oc_prefetched_data,
         )
 
         collection = collector.collect(
@@ -283,10 +323,13 @@ async def analyze(
     website_url:        Optional[str]   = Form(None),
     sector:             Optional[str]   = Form(None),
     crunchbase_api_key: Optional[str]   = Form(None),
-    linkedin_url:       Optional[str]   = Form(None),
-    vat_number:         Optional[str]   = Form(None),
-    pitch_file:         Optional[UploadFile] = File(None),
-    bilancio_file:      Optional[UploadFile] = File(None),
+    linkedin_url:             Optional[str]   = Form(None),
+    vat_number:               Optional[str]   = Form(None),
+    ufficiocamerale_html:     Optional[str]   = Form(None),
+    ufficiocamerale_url:      Optional[str]   = Form(None),
+    opencorporates_html:      Optional[str]   = Form(None),
+    pitch_file:               Optional[UploadFile] = File(None),
+    bilancio_file:            Optional[UploadFile] = File(None),
 ):
     """
     Lancia l'analisi in background.
@@ -323,6 +366,8 @@ async def analyze(
         pitch_text, bilancio_text,
         website_url, sector, crunchbase_api_key,
         linkedin_url or "", vat_number or "",
+        ufficiocamerale_html or "", ufficiocamerale_url or "",
+        opencorporates_html or "",
     )
 
     log.info(f"[{job_id[:8]}] Analisi avviata per '{company_name}'")
@@ -423,6 +468,131 @@ def download_report(job_id: str):
         media_type="application/pdf",
         filename=filename,
     )
+
+
+# ─────────────────────────────────────────────
+#  Proxy fetch + parse (IP forwarding)
+# ─────────────────────────────────────────────
+
+@app.get("/api/proxy-fetch")
+async def proxy_fetch(
+    url:     str,
+    request: Request,
+):
+    """
+    Proxy fetch: scarica un URL passando l'IP reale del client come
+    X-Forwarded-For. Molti siti italiani controllano questo header
+    per decidere se bloccare o meno.
+    """
+    import requests as req
+    import re
+
+    # Whitelist di domini autorizzati (sicurezza)
+    allowed_domains = [
+        "ufficiocamerale.it",
+        "opencorporates.com",
+    ]
+    if not any(d in url for d in allowed_domains):
+        raise HTTPException(400, "Dominio non autorizzato")
+
+    # Ottieni IP reale del client
+    client_ip = (
+        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or request.headers.get("x-real-ip", "")
+        or (request.client.host if request.client else "")
+    )
+
+    headers = {
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer":         "https://www.google.it/",
+        "DNT":             "1",
+    }
+    if client_ip:
+        headers["X-Forwarded-For"] = client_ip
+        headers["X-Real-IP"]       = client_ip
+
+    try:
+        resp = req.get(url, headers=headers, timeout=15, allow_redirects=True)
+        return {
+            "status":   resp.status_code,
+            "html":     resp.text[:500_000],  # max 500KB
+            "final_url": str(resp.url),
+        }
+    except Exception as e:
+        raise HTTPException(502, f"Fetch fallito: {e}")
+
+
+@app.post("/api/parse/ufficiocamerale")
+async def parse_ufficiocamerale(
+    html:        str = Form(...),
+    page_url:    str = Form(...),
+    vat_number:  str = Form(...),
+):
+    """Parsa HTML di ufficiocamerale.it pre-fetchato."""
+    from data_collector import UfficioCameraleConnector, InMemoryCache
+    connector = UfficioCameraleConnector(cache=InMemoryCache())
+    data = connector.parse_html(html, page_url, vat_number)
+    if data:
+        return {"found": True, "data": data}
+    return {"found": False, "data": None}
+
+
+@app.post("/api/parse/opencorporates")
+async def parse_opencorporates(
+    html:         str = Form(...),
+    page_url:     str = Form(...),
+    company_name: str = Form(...),
+):
+    """Parsa HTML di opencorporates.com pre-fetchato."""
+    from data_collector import OpenCorporatesConnector, InMemoryCache
+    connector = OpenCorporatesConnector(cache=InMemoryCache())
+    data = connector.parse_html(html, page_url)
+    if data:
+        return {"found": True, "data": data}
+    return {"found": False, "data": None}
+
+
+# ─────────────────────────────────────────────
+#  Endpoint di diagnostica
+# ─────────────────────────────────────────────
+
+@app.post("/api/parse/ufficiocamerale")
+async def parse_ufficiocamerale(
+    html:        str = Form(...),
+    page_url:    str = Form(...),
+    vat_number:  str = Form(...),
+):
+    """
+    Riceve HTML di ufficiocamerale.it pre-fetchato dal browser
+    e restituisce i dati estratti (fatturato, dipendenti, ATECO).
+    """
+    from data_collector import UfficioCameraleConnector, InMemoryCache
+    connector = UfficioCameraleConnector(cache=InMemoryCache())
+    data = connector.parse_html(html, page_url, vat_number)
+    if data:
+        return {"found": True, "data": data}
+    return {"found": False, "data": None}
+
+
+@app.post("/api/parse/opencorporates")
+async def parse_opencorporates(
+    html:         str = Form(...),
+    page_url:     str = Form(...),
+    company_name: str = Form(...),
+):
+    """
+    Riceve HTML di opencorporates.com pre-fetchato dal browser
+    e restituisce i dati legali estratti.
+    """
+    from data_collector import OpenCorporatesConnector, InMemoryCache
+    connector = OpenCorporatesConnector(cache=InMemoryCache())
+    data = connector.parse_html(html, page_url)
+    if data:
+        return {"found": True, "data": data}
+    return {"found": False, "data": None}
 
 
 # ─────────────────────────────────────────────
