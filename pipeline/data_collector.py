@@ -142,12 +142,12 @@ class BaseConnector(ABC):
             time.sleep(self.REQUEST_DELAY - elapsed)
         self._last_request = time.time()
 
-    def _get(self, url: str, headers: dict = None, params: dict = None) -> requests.Response:
+    def _get(self, url: str, headers: dict = None, params: dict = None, timeout: int = None) -> requests.Response:
         self._throttle()
         h = {"User-Agent": "TrueScore/1.0 (business verification tool; respectful crawler)"}
         if headers:
             h.update(headers)
-        return requests.get(url, headers=h, params=params, timeout=self.timeout)
+        return requests.get(url, headers=h, params=params, timeout=timeout or self.timeout)
 
     @abstractmethod
     def fetch(self, claim: dict, company_name: str) -> ConnectorResult:
@@ -316,16 +316,34 @@ class PartnerWebsiteConnector(BaseConnector):
     def _scrape_partner_page(self, base_url: str, company_name: str) -> Optional[dict]:
         """
         Cerca una pagina partner/clienti sul sito aziendale e conta i partner elencati.
+        Timeout aggressivo per non bloccare la pipeline.
         """
         # Normalizza base_url
         if not base_url.startswith("http"):
             base_url = "https://" + base_url
 
-        for slug in self.PARTNER_SLUGS:
-            url = base_url + slug
+        # Prima controlla la homepage per link a sezione partner
+        try:
+            resp = self._get(base_url, timeout=6)
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for a in soup.select("a[href]"):
+                    href   = a.get("href", "").lower()
+                    text   = a.get_text(strip=True).lower()
+                    if any(kw in href or kw in text for kw in
+                           ["partner", "client", "brand", "network",
+                            "ecosystem", "collabor", "chi-usa"]):
+                        full = href if href.startswith("http") else base_url + "/" + href.lstrip("/")
+                        if full not in [base_url, base_url + "/"]:
+                            self.PARTNER_SLUGS = [full.replace(base_url, "")] + self.PARTNER_SLUGS
+        except Exception:
+            pass
+
+        for slug in self.PARTNER_SLUGS[:8]:   # max 8 slug, non tutti i 14
+            url = base_url + slug if not slug.startswith("http") else slug
             try:
-                time.sleep(self.REQUEST_DELAY)
-                resp = self._get(url)
+                time.sleep(0.5)   # delay ridotto da 2s a 0.5s
+                resp = self._get(url, timeout=5)   # timeout aggressivo
                 if resp.status_code != 200:
                     continue
 
@@ -863,32 +881,65 @@ class UfficioCameraleConnector(BaseConnector):
             return None
 
     def _find_page_url(self, vat_number: str, company_name: str) -> Optional[str]:
-        """Trova l'URL della pagina aziendale via Google."""
+        """
+        Trova l'URL della pagina aziendale su ufficiocamerale.it.
+        Strategia (in ordine):
+        1. URL diretto /{vat_number} — il più affidabile
+        2. URL diretto /cerca?piva={vat_number}
+        3. Ricerca Google come ultimo tentativo
+        """
+        # Tentativo 1: URL diretto con P.IVA
+        candidates = [
+            f"https://www.ufficiocamerale.it/{vat_number}",
+            f"https://www.ufficiocamerale.it/visura-camerale-gratuita/{vat_number}",
+            f"https://www.ufficiocamerale.it/cerca?piva={vat_number}",
+        ]
+        for direct in candidates:
+            try:
+                time.sleep(1.0)
+                r = self._get(direct)
+                if r.status_code == 200 and (vat_number in r.text or company_name.lower() in r.text.lower()):
+                    log.info(f"UfficioCamerale: trovata pagina diretta: {direct}")
+                    return direct
+            except Exception:
+                continue
+
+        # Tentativo 2: ricerca sul sito stesso
+        try:
+            search_url = f"https://www.ufficiocamerale.it/cerca?q={quote_plus(vat_number)}"
+            time.sleep(1.5)
+            r = self._get(search_url)
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, "html.parser")
+                for a in soup.select("a[href]"):
+                    href = a.get("href", "")
+                    if vat_number in href or (
+                        "ufficiocamerale.it" in href
+                        and "/cerca" not in href
+                        and "/trova-azienda" not in href
+                        and len(href) > 30
+                    ):
+                        if href.startswith("/"):
+                            href = "https://www.ufficiocamerale.it" + href
+                        return href
+        except Exception as e:
+            log.debug(f"UfficioCamerale search page: {e}")
+
+        # Tentativo 3: Google (potrebbe essere bloccato da server)
         try:
             query = f'site:ufficiocamerale.it "{vat_number}"'
             url   = f"{self.GOOGLE_SEARCH}{quote_plus(query)}"
             resp  = self._get(url)
             soup  = BeautifulSoup(resp.text, "html.parser")
-
             for a in soup.select("a[href]"):
                 href = a.get("href", "")
                 if "ufficiocamerale.it/" in href and "/trova-azienda" not in href:
-                    # Estrai URL pulito dal redirect Google
                     match = re.search(r"https?://www\.ufficiocamerale\.it/[^\s&'\"]+", href)
                     if match:
                         return match.group(0)
-
-            # Fallback: prova URL diretto con P.IVA come slug
-            direct = f"https://www.ufficiocamerale.it/{vat_number}"
-            try:
-                r = self._get(direct)
-                if r.status_code == 200 and vat_number in r.text:
-                    return direct
-            except Exception:
-                pass
-
         except Exception as e:
-            log.warning(f"UfficioCamerale: errore ricerca Google: {e}")
+            log.debug(f"UfficioCamerale Google: {e}")
+
         return None
 
     def _extract_data(self, soup: "BeautifulSoup", page_url: str, vat_number: str) -> Optional[dict]:
@@ -1066,9 +1117,11 @@ class OpenCorporatesConnector(BaseConnector):
 
     def _search_company(self, company_name: str) -> Optional[dict]:
         """
-        Cerca l'azienda su OpenCorporates per giurisdizione IT.
-        Strategia: cerca per nome, prende il primo risultato attivo con match esatto.
+        Cerca l'azienda su OpenCorporates.
+        Strategia 1: API pubblica (funziona senza token per alcune query)
+        Strategia 2: scraping della pagina di ricerca del sito web
         """
+        # Tentativo 1: API (potrebbe funzionare senza token)
         try:
             time.sleep(self.REQUEST_DELAY)
             resp = self._get(
@@ -1080,22 +1133,71 @@ class OpenCorporatesConnector(BaseConnector):
                     "order":            "score",
                 }
             )
-            resp.raise_for_status()
-            results = resp.json().get("results", {}).get("companies", [])
+            if resp.status_code == 200:
+                results = resp.json().get("results", {}).get("companies", [])
+                if results:
+                    best = self._pick_best_match(results, company_name)
+                    if best:
+                        return self._extract_data(best.get("company", {}))
+        except Exception:
+            pass
+
+        # Tentativo 2: scraping pagina web OpenCorporates
+        return self._scrape_opencorporates(company_name)
+
+    def _scrape_opencorporates(self, company_name: str) -> Optional[dict]:
+        """Fallback: scraping della pagina di ricerca pubblica di opencorporates.com"""
+        try:
+            time.sleep(self.REQUEST_DELAY)
+            url  = f"https://opencorporates.com/companies?q={quote_plus(company_name)}&jurisdiction_code=it&type=company"
+            resp = self._get(url)
+            if resp.status_code != 200:
+                return None
+
+            soup    = BeautifulSoup(resp.text, "html.parser")
+            results = soup.select("li.search-result")
+            if not results:
+                # Prova selettore alternativo
+                results = soup.select("ul.companies li, .company-result")
 
             if not results:
                 return None
 
-            # Seleziona il miglior match: preferisce aziende attive e nome simile
-            best = self._pick_best_match(results, company_name)
-            if not best:
+            # Prendi il primo risultato
+            first = results[0]
+            link  = first.select_one("a[href*='/companies/it/']")
+            if not link:
                 return None
 
-            company = best.get("company", {})
-            return self._extract_data(company)
+            company_url = "https://opencorporates.com" + link["href"]
+            name        = link.get_text(strip=True)
+
+            # Leggi lo stato dalla card
+            status_tag  = first.select_one(".status, .inactive, span.label")
+            inactive    = status_tag and "inactive" in (status_tag.get("class", []) + [status_tag.get_text(strip=True).lower()])
+
+            # Ottieni numero registro dall'URL (es. /companies/it/12345678)
+            company_number = link["href"].split("/")[-1]
+
+            return {
+                "name":               name,
+                "company_number":     company_number,
+                "jurisdiction_code":  "it",
+                "company_type":       "",
+                "incorporation_date": None,
+                "dissolution_date":   None,
+                "current_status":     "inactive" if inactive else "active",
+                "status_normalized":  "cessata" if inactive else "attiva",
+                "inactive":           inactive,
+                "registered_address": "",
+                "previous_names":     [],
+                "opencorporates_url": company_url,
+                "registry_url":       "",
+                "source":             "opencorporates_scraping",
+            }
 
         except Exception as e:
-            log.warning(f"OpenCorporates search error per '{company_name}': {e}")
+            log.warning(f"OpenCorporates scraping error per '{company_name}': {e}")
             return None
 
     def _pick_best_match(self, results: list, query: str) -> Optional[dict]:
