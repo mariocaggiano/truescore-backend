@@ -134,6 +134,8 @@ async def run_pipeline(
     website_url: Optional[str],
     sector: Optional[str],
     crunchbase_api_key: Optional[str],
+    linkedin_url: str = "",
+    vat_number: str = "",
 ):
     try:
         _job_update(job_id, status="running", started_at=time.time())
@@ -174,6 +176,8 @@ async def run_pipeline(
             financial_data=fin.__dict__ if fin else None,
             crunchbase_api_key=crunchbase_api_key or "",
             cache=InMemoryCache(),
+            linkedin_url=linkedin_url,
+            vat_number=vat_number,
         )
 
         collection = collector.collect(
@@ -278,6 +282,8 @@ async def analyze(
     website_url:        Optional[str]   = Form(None),
     sector:             Optional[str]   = Form(None),
     crunchbase_api_key: Optional[str]   = Form(None),
+    linkedin_url:       Optional[str]   = Form(None),
+    vat_number:         Optional[str]   = Form(None),
     pitch_file:         Optional[UploadFile] = File(None),
     bilancio_file:      Optional[UploadFile] = File(None),
 ):
@@ -315,6 +321,7 @@ async def analyze(
         job_id, company_name,
         pitch_text, bilancio_text,
         website_url, sector, crunchbase_api_key,
+        linkedin_url or "", vat_number or "",
     )
 
     log.info(f"[{job_id[:8]}] Analisi avviata per '{company_name}'")
