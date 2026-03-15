@@ -880,6 +880,19 @@ class UfficioCameraleConnector(BaseConnector):
             log.warning(f"UfficioCamerale scraping error: {e}")
             return None
 
+    def parse_html(self, html: str, page_url: str, vat_number: str) -> Optional[dict]:
+        """
+        Parsa HTML pre-fetchato dal browser client.
+        Chiamato quando il backend riceve HTML già scaricato lato client.
+        """
+        try:
+            from bs4 import BeautifulSoup as BS
+            soup = BS(html, "html.parser")
+            return self._extract_data(soup, page_url, vat_number)
+        except Exception as e:
+            log.warning(f"UfficioCamerale parse_html error: {e}")
+            return None
+
     def _find_page_url(self, vat_number: str, company_name: str) -> Optional[str]:
         """
         Trova l'URL della pagina aziendale su ufficiocamerale.it.
@@ -1121,6 +1134,47 @@ class OpenCorporatesConnector(BaseConnector):
             found=False,
             notes=f"Azienda '{company_name}' non trovata su OpenCorporates"
         )
+
+    def parse_html(self, html: str, page_url: str) -> Optional[dict]:
+        """
+        Parsa HTML della pagina di ricerca OpenCorporates pre-fetchata dal browser.
+        """
+        try:
+            from bs4 import BeautifulSoup as BS
+            soup = BeautifulSoup(html, "html.parser")
+            links = (
+                soup.select("a[href*='/companies/it/']") or
+                soup.select("ul.companies a") or
+                soup.select(".search-result a")
+            )
+            for link in links[:3]:
+                href = link.get("href", "")
+                if "/companies/it/" not in href:
+                    continue
+                company_url    = "https://opencorporates.com" + href if href.startswith("/") else href
+                name           = link.get_text(strip=True)
+                company_number = href.rstrip("/").split("/")[-1]
+                inactive       = "inactive" in html.lower()
+                return {
+                    "name":               name,
+                    "company_number":     company_number,
+                    "jurisdiction_code":  "it",
+                    "company_type":       "",
+                    "incorporation_date": None,
+                    "dissolution_date":   None,
+                    "current_status":     "inactive" if inactive else "active",
+                    "status_normalized":  "cessata" if inactive else "attiva",
+                    "inactive":           inactive,
+                    "registered_address": "",
+                    "previous_names":     [],
+                    "opencorporates_url": company_url,
+                    "registry_url":       "",
+                    "source":             "opencorporates_client_fetch",
+                }
+            return None
+        except Exception as e:
+            log.warning(f"OpenCorporates parse_html error: {e}")
+            return None
 
     def _search_company(self, company_name: str) -> Optional[dict]:
         """
@@ -1489,10 +1543,25 @@ class DataCollector:
         cache: Optional[InMemoryCache] = None,
         linkedin_url: str = "",
         vat_number: str = "",
+        uc_prefetched: Optional[dict] = None,   # dati UfficioCamerale pre-parsati dal browser
+        oc_prefetched: Optional[dict] = None,   # dati OpenCorporates pre-parsati dal browser
     ):
         shared_cache = cache or InMemoryCache()
-        self.linkedin_url = linkedin_url.strip()
-        self.vat_number   = vat_number.strip()
+        self.linkedin_url  = linkedin_url.strip()
+        self.vat_number    = vat_number.strip()
+        self.uc_prefetched = uc_prefetched
+        self.oc_prefetched = oc_prefetched
+
+        # Pre-popola la cache con i dati già ottenuti dal browser
+        if uc_prefetched:
+            cache_key = shared_cache.make_key("ufficiocamerale", self.vat_number)
+            shared_cache.set(cache_key, json.dumps(uc_prefetched))
+            log.info(f"DataCollector: UfficioCamerale pre-fetchato caricato in cache")
+        if oc_prefetched:
+            # Usa company_name come chiave — verrà trovato al primo fetch
+            cache_key = shared_cache.make_key("opencorporates", oc_prefetched.get("name",""))
+            shared_cache.set(cache_key, json.dumps(oc_prefetched))
+            log.info(f"DataCollector: OpenCorporates pre-fetchato caricato in cache ({oc_prefetched.get('name','')})")
 
         self.connectors: dict[str, BaseConnector] = {
             "bilancio":        BilancioConnector(financial_data=financial_data, cache=shared_cache),
