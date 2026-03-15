@@ -1080,8 +1080,10 @@ class VerificationEngine:
         verif_weight = sum(CLAIM_TYPE_WEIGHTS.get(v.claim_type, 0.05) for v in verifiable)
 
         # Copertura insufficiente → non valutabile
+        # Soglia adattiva: con poche claim (1-2) basta il 20%, con molte il 30%
+        min_coverage = 0.20 if len(verdicts) <= 2 else 0.30
         coverage = verif_weight / all_weight if all_weight > 0 else 0
-        if coverage < 0.30 or not verifiable:
+        if coverage < min_coverage or not verifiable:
             return -1.0
 
         weighted_sum = 0.0
