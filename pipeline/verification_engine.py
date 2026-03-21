@@ -106,6 +106,10 @@ class VerificationResult:
     legal_status: Optional[dict]     = None   # dati OpenCorporates
     key_people: Optional[dict]       = None   # persone chiave da PeopleFinder
     news_flags: Optional[dict]        = None   # red flags da NewsAPI
+    web_history: Optional[dict]       = None   # storia sito (Wayback)
+    job_postings: Optional[dict]      = None   # job postings LinkedIn
+    email_domain: Optional[dict]      = None   # verifica DNS email
+    tech_stack: Optional[dict]        = None   # tecnologie sito web
 
     def summary(self) -> str:
         lines = [
@@ -137,6 +141,10 @@ class VerificationResult:
             "legal_status": self.legal_status,
             "key_people":   self.key_people,
             "news_flags":   self.news_flags,
+            "web_history":  self.web_history,
+            "job_postings": self.job_postings,
+            "email_domain": self.email_domain,
+            "tech_stack":   self.tech_stack,
             "errors": self.errors,
         }
 
@@ -1265,6 +1273,19 @@ class VerificationEngine:
 
         # ── Verifica liquidazione ─────────────────────────────────────────
         LiquidationEnricher.enrich(result, raw_results)
+
+        # ── Enrichers supplementari ───────────────────────────────────────
+        try:
+            from enrichers import (WebHistoryEnricher, JobPostingsEnricher,
+                                   EmailDomainEnricher, TechStackEnricher)
+            website_url  = getattr(result, "_website_url", "")
+            linkedin_url = getattr(result, "_linkedin_url", "")
+            WebHistoryEnricher.enrich(result, raw_results)
+            EmailDomainEnricher.enrich(result, website_url, result.company_name)
+            TechStackEnricher.enrich(result, website_url)
+            JobPostingsEnricher.enrich(result, linkedin_url, result.company_name)
+        except Exception as _e:
+            log.debug(f"Enrichers supplementari: {_e}")
 
         # ── Calcola Trust Score ───────────────────────────────────────────
         result.trust_score = self._compute_trust_score(result.verdicts)
