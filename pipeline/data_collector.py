@@ -788,69 +788,15 @@ class LinkedInConnector(BaseConnector):
         return ""
 
     @staticmethod
-    def _extract_key_people(soup: BeautifulSoup, profile_url: str) -> list[dict]:
+    @staticmethod
+    def _extract_key_people(soup, profile_url: str) -> list[dict]:
         """
-        Estrae persone chiave dalla pagina LinkedIn aziendale pubblica.
-        LinkedIn mostra highlight di dipendenti e dirigenti nel HTML pubblico.
-        Strategia: cerca pattern "Nome Cognome\nRuolo" nel testo della pagina.
+        LinkedIn page HTML è JavaScript-rendered — il pattern matching sul testo
+        statico genera troppi falsi positivi. Le persone vengono estratte dal
+        pitch deck via LLM (più affidabile). Questo metodo è disabilitato.
         """
-        people = []
-        text   = soup.get_text("\n", strip=True)
-        lines  = [l.strip() for l in text.split("\n") if l.strip()]
+        return []
 
-        # Ruoli C-suite da cercare
-        c_suite_keywords = [
-            "ceo", "chief executive", "founder", "co-founder", "fondatore",
-            "cfo", "chief financial", "coo", "chief operating",
-            "cto", "chief technology", "cmo", "chief marketing",
-            "presidente", "managing director", "direttore generale",
-            "vp ", "vice president", "head of", "director", "direttore",
-            "partner", "principal",
-        ]
-
-        seen_names = set()
-
-        for i, line in enumerate(lines):
-            line_lower = line.lower()
-            # Il ruolo deve contenere una parola chiave
-            if not any(kw in line_lower for kw in c_suite_keywords):
-                continue
-            # Il ruolo non deve essere troppo lungo (>80 char = probabilmente non un titolo)
-            if len(line) > 80 or len(line) < 3:
-                continue
-
-            # Cerca il nome nelle righe precedenti (LinkedIn: nome sopra, ruolo sotto)
-            for offset in [-1, -2, 1]:
-                idx = i + offset
-                if 0 <= idx < len(lines):
-                    candidate = lines[idx].strip()
-                    parts = candidate.split()
-                    # Nome valido: 2-4 parole, iniziali maiuscole, non un'URL o numero
-                    if (2 <= len(parts) <= 4
-                            and all(p[0].isupper() for p in parts if p)
-                            and not any(c in candidate for c in ["@", "http", "/", "•", "|"])
-                            and candidate not in seen_names):
-                        seen_names.add(candidate)
-                        people.append({
-                            "name":       candidate,
-                            "role":       line.strip(),
-                            "source":     "linkedin_company_page",
-                            "url":        profile_url,
-                            "linkedin":   "",
-                            "confidence": 0.72,
-                        })
-                        break
-
-        # Dedup aggressivo: tieni solo il primo per nome cognome
-        seen = set()
-        deduped = []
-        for p in people:
-            key = p["name"].lower()
-            if key not in seen:
-                seen.add(key)
-                deduped.append(p)
-
-        return deduped[:10]  # max 10
 
     @staticmethod
     def _range_midpoint(headcount_str: str) -> Optional[int]:
@@ -1492,16 +1438,30 @@ class PeopleFinderConnector(BaseConnector):
         people  = []
         sources = []
 
+        # ── Sorgente 0: persone dal pitch deck via LLM (priorità massima) ──────
+        pitch_people_json = claim.get("pitch_key_people", "[]")
+        try:
+            pitch_people = json.loads(pitch_people_json) if isinstance(pitch_people_json, str) else pitch_people_json
+            if pitch_people:
+                for p in pitch_people:
+                    p["source"] = p.get("source", "pitch_deck_llm")
+                people.extend(pitch_people)
+                sources.append("pitch_deck_llm")
+                log.info(f"PeopleFinder: {len(pitch_people)} persone dal pitch deck")
+        except Exception:
+            pass
+
         # ── Sorgente 1: LinkedIn company page (già in cache da LinkedInConnector) ──
         li_cached_key = self.cache.make_key("linkedin", company_name)
         li_cached = self.cache.get(li_cached_key)
         if li_cached:
             li_data = json.loads(li_cached)
             li_kp   = li_data.get("key_people", [])
+            # LinkedIn HTML è JS-rendered → key_people sarà sempre []
+            # Manteniamo il codice per future implementazioni
             if li_kp:
                 people.extend(li_kp)
                 sources.append("linkedin_company_page")
-                log.info(f"PeopleFinder: {len(li_kp)} persone da LinkedIn cache")
 
         # ── Sorgente 2: pagina /team o /about del sito ────────────────────────────
         if website_url:
@@ -1999,6 +1959,7 @@ class DataCollector:
         uc_prefetched: Optional[dict] = None,   # dati UfficioCamerale pre-parsati dal browser
         oc_prefetched: Optional[dict] = None,   # dati OpenCorporates pre-parsati dal browser
         proxy_base_url: str = "",               # URL del backend per proxy fetch
+        pitch_key_people: list = None,          # persone chiave estratte dal pitch deck
     ):
         shared_cache = cache or InMemoryCache()
         self.linkedin_url    = linkedin_url.strip()
@@ -2006,6 +1967,7 @@ class DataCollector:
         self.uc_prefetched   = uc_prefetched
         self.oc_prefetched   = oc_prefetched
         self.proxy_base_url  = proxy_base_url.strip()
+        self.pitch_key_people = pitch_key_people or []
 
         # Pre-popola la cache con i dati già ottenuti dal browser
         if uc_prefetched:
@@ -2042,14 +2004,17 @@ class DataCollector:
 
         # ── Baseline: OpenCorporates e UfficioCamerale girano SEMPRE ─────────
         # Servono per la sezione Stato Legale anche quando ci sono 0 claim.
+        # key_people dal pitch deck (passati come JSON serializzato)
+        pitch_kp_json = json.dumps(getattr(self, "pitch_key_people", []))
         baseline_claim = {
-            "id":               "BASELINE_LEGAL",
-            "type":             "other",
-            "normalized_value": None,
-            "website_url":      website_url,
-            "vat_number":       self.vat_number,
-            "linkedin_url":     self.linkedin_url,
-            "proxy_base_url":   getattr(self, "proxy_base_url", ""),
+            "id":                "BASELINE_LEGAL",
+            "type":              "other",
+            "normalized_value":  None,
+            "website_url":       website_url,
+            "vat_number":        self.vat_number,
+            "linkedin_url":      self.linkedin_url,
+            "proxy_base_url":    getattr(self, "proxy_base_url", ""),
+            "pitch_key_people":  pitch_kp_json,
         }
         for name in ["opencorporates", "ufficiocamerale", "people_finder"]:
             if name == "ufficiocamerale" and not self.vat_number:
@@ -2084,6 +2049,8 @@ class DataCollector:
                 claim_dict = {**claim_dict, "vat_number": self.vat_number}
             if self.proxy_base_url:
                 claim_dict = {**claim_dict, "proxy_base_url": self.proxy_base_url}
+            if hasattr(self, "pitch_key_people") and self.pitch_key_people:
+                claim_dict = {**claim_dict, "pitch_key_people": json.dumps(self.pitch_key_people)}
 
             claim_type = claim_dict.get("type", "other")
             connector_names = list(self.CLAIM_CONNECTOR_MAP.get(claim_type, []))
