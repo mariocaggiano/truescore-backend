@@ -152,11 +152,21 @@ async def run_pipeline(
 
         declarative = []
         if pitch_text:
-            declarative.append({"type": "text", "text": pitch_text, "label": "pitch_deck"})
+            if pitch_text.startswith("__PDF_PATH__:"):
+                pdf_path = pitch_text[len("__PDF_PATH__:"):]
+                declarative.append({"type": "pdf", "path": pdf_path, "label": "pitch_deck"})
+                log.info(f"[{job_id[:8]}] Pitch deck: parsing PDF da {pdf_path}")
+            else:
+                declarative.append({"type": "text", "text": pitch_text, "label": "pitch_deck"})
 
         probatory = []
         if bilancio_text:
-            probatory.append({"type": "text", "text": bilancio_text, "label": "bilancio_infocamere"})
+            if bilancio_text.startswith("__PDF_PATH__:"):
+                pdf_path = bilancio_text[len("__PDF_PATH__:"):]
+                probatory.append({"type": "pdf", "path": pdf_path, "label": "bilancio_infocamere"})
+                log.info(f"[{job_id[:8]}] Bilancio: parsing PDF da {pdf_path}")
+            else:
+                probatory.append({"type": "text", "text": bilancio_text, "label": "bilancio_infocamere"})
 
         extraction = extractor.extract(
             company_name=company_name,
@@ -350,11 +360,28 @@ async def analyze(
     # Leggi contenuto file se forniti
     if pitch_file:
         raw = await pitch_file.read()
-        pitch_text = raw.decode("utf-8", errors="replace")
+        fname = (pitch_file.filename or "").lower()
+        if fname.endswith(".pdf"):
+            # Salva su disco e lascia che pdfplumber lo legga correttamente
+            import tempfile, os
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(raw)
+                _pitch_tmp = tmp.name
+            pitch_text = f"__PDF_PATH__:{_pitch_tmp}"
+        else:
+            pitch_text = raw.decode("utf-8", errors="replace")
 
     if bilancio_file:
         raw = await bilancio_file.read()
-        bilancio_text = raw.decode("utf-8", errors="replace")
+        fname = (bilancio_file.filename or "").lower()
+        if fname.endswith(".pdf"):
+            import tempfile, os
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(raw)
+                _bilancio_tmp = tmp.name
+            bilancio_text = f"__PDF_PATH__:{_bilancio_tmp}"
+        else:
+            bilancio_text = raw.decode("utf-8", errors="replace")
 
     job_id = str(uuid.uuid4())
     JOBS[job_id] = {
