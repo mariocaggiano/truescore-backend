@@ -475,20 +475,26 @@ Rispondi SOLO con JSON valido. Nessun testo prima o dopo.
 """
 
 FINANCIAL_EXTRACTION_SYSTEM = """Sei un analista contabile specializzato nell'interpretazione di bilanci italiani.
-Stai analizzando un bilancio scaricato dal portale Infocamere.
+Stai analizzando un bilancio scaricato dal portale Infocamere o documento simile.
 
 Estrai i seguenti dati se presenti:
-- exercise_year: anno di chiusura dell'esercizio (intero)
-- revenues: ricavi delle vendite e delle prestazioni in euro (numero, senza simboli)
-- total_assets: totale attivo stato patrimoniale in euro
-- employees: numero medio dipendenti nell'esercizio (intero)
+- exercise_year: anno di chiusura dell'esercizio (intero). Cerca "esercizio", "al 31/12/YYYY", "anno YYYY"
+- revenues: ricavi totali in euro (numero intero, senza simboli, senza punti separatori).
+  Cerca NELL'ORDINE: "Ricavi delle vendite e delle prestazioni", "A) Valore della produzione",
+  "Totale valore della produzione", "Ricavi netti", "Fatturato", "Valore della produzione",
+  "Proventi". Prendi il PRIMO valore trovato. Se trovi "869.619" scrivi 869619.
+- total_assets: totale attivo in euro
+- employees: numero dipendenti (intero). Cerca "dipendenti", "addetti", "n. medio"
 - legal_form: forma giuridica (es. "S.r.l.", "S.p.A.")
 - share_capital: capitale sociale in euro
-- extraction_confidence: quanto sei sicuro dell'estrazione (0.0-1.0)
-- raw_excerpt: citazione testuale di max 200 caratteri dal documento che riporta i ricavi
+- extraction_confidence: 0.0-1.0 (alta se hai trovato il dato direttamente, bassa se stimato)
+- raw_excerpt: citazione testuale di max 200 caratteri con i ricavi trovati
+
+ATTENZIONE: i numeri nei bilanci italiani usano il punto come separatore delle migliaia
+(es. 1.234.567 = un milione duecentotrentaquattromila). Converti sempre in intero senza punti.
 
 Rispondi SOLO con un oggetto JSON valido con queste chiavi esatte.
-Se un dato non è presente, usa null.
+Se un dato non è presente nel testo, usa null.
 Nessun testo prima o dopo il JSON.
 """
 
@@ -604,6 +610,32 @@ class ClaimExtractor:
                         log.info(f"[{doc_label}] Dati finanziari estratti: ricavi={fin.revenues}")
                 except Exception as e:
                     result.errors.append(f"Errore bilancio {source}: {e}")
+
+        # ── Claim sintetica dal bilancio se nessuna claim revenue trovata ────
+        if result.financial_data and result.financial_data.revenues:
+            has_revenue = any(
+                (c.type.value if hasattr(c.type, "value") else c.type) == "revenue"
+                for c in result.claims
+            )
+            if not has_revenue:
+                rev  = result.financial_data.revenues
+                year = result.financial_data.exercise_year or "N/D"
+                try:
+                    synthetic = self._build_claim({
+                        "type":                  "revenue",
+                        "text":                  f"Ricavi esercizio {year}: €{int(rev):,} (da bilancio depositato)",
+                        "normalized_value":      str(int(rev)),
+                        "specificity":           "high",
+                        "verifiable":            True,
+                        "extraction_confidence": result.financial_data.extraction_confidence,
+                        "source_document":       "bilancio_infocamere",
+                        "source_location":       "bilancio",
+                        "notes":                 "Generata automaticamente dai dati del bilancio",
+                    }, index=len(result.claims))
+                    result.claims.append(synthetic)
+                    log.info(f"Claim revenue sintetica aggiunta: €{int(rev):,}")
+                except Exception as e:
+                    log.warning(f"Claim sintetica non creata: {e}")
 
         log.info(f"Estrazione completata: {result.summary()}")
         return result
