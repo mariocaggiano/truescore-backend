@@ -1228,38 +1228,57 @@ class VerificationEngine:
     @staticmethod
     def _compute_trust_score(verdicts: list[ClaimVerdict]) -> float:
         """
-        Trust Score 0–10, calcolato SOLO sulle claim effettivamente verificate.
+        Trust Score 0–10. Tre valori speciali negativi:
+          -1.0  = nessun dato trovato per nessuna claim
+          -2.0  = dati trovati ma nessun valore numerico dichiarato nel pitch
+                  (fonti interrogate con successo, ma nulla da confrontare)
 
-        Logica:
-        - Le claim con INSUFFICIENT_DATA o UNCERTAIN non entrano nel calcolo
-          del punteggio: non sapere ≠ inaffidabile.
-        - Se la copertura verificabile è < 30% del peso totale possibile,
-          il sistema restituisce -1 (segnale speciale = "non valutabile").
-        - Il Trust Score riflette solo i verdict concreti (verified / warning /
-          discrepancy) pesati per tipo di claim e confidence.
+        Logica per il calcolo positivo:
+        - Solo claim VERIFIED / WARNING / DISCREPANCY entrano nel calcolo.
+        - UNCERTAIN con verified_value trovato contribuisce parzialmente.
+        - Copertura minima: 20% (≤2 claim) o 30% (>2 claim).
         """
         if not verdicts:
-            return -1.0   # nessuna claim = non valutabile
+            return -1.0
 
-        # Separa claim verificabili da quelle senza dati
         verifiable = [
             v for v in verdicts
             if v.verdict not in (Verdict.INSUFFICIENT_DATA, Verdict.UNCERTAIN)
         ]
+        uncertain_with_data = [
+            v for v in verdicts
+            if v.verdict == Verdict.UNCERTAIN and v.verified_value is not None
+        ]
+        no_data = [
+            v for v in verdicts
+            if v.verdict == Verdict.INSUFFICIENT_DATA
+        ]
+
         all_weight   = sum(CLAIM_TYPE_WEIGHTS.get(v.claim_type, 0.05) for v in verdicts)
         verif_weight = sum(CLAIM_TYPE_WEIGHTS.get(v.claim_type, 0.05) for v in verifiable)
 
-        # Copertura insufficiente → non valutabile
-        # Soglia adattiva: con poche claim (1-2) basta il 20%, con molte il 30%
         min_coverage = 0.20 if len(verdicts) <= 2 else 0.30
-        coverage = verif_weight / all_weight if all_weight > 0 else 0
-        if coverage < min_coverage or not verifiable:
+        coverage     = verif_weight / all_weight if all_weight > 0 else 0
+
+        # Nessuna claim verificabile direttamente
+        if not verifiable:
+            # Dati trovati ma nessun valore dichiarato nel pitch → -2
+            if uncertain_with_data:
+                return -2.0
+            # Proprio nessun dato → -1
             return -1.0
 
+        if coverage < min_coverage:
+            # Copertura bassa ma almeno qualcosa di incerto con dati → -2
+            if uncertain_with_data:
+                return -2.0
+            return -1.0
+
+        # Calcolo normale sulle claim verificabili
         weighted_sum = 0.0
         weight_total = 0.0
         for v in verifiable:
-            w = CLAIM_TYPE_WEIGHTS.get(v.claim_type, 0.05)
+            w     = CLAIM_TYPE_WEIGHTS.get(v.claim_type, 0.05)
             score = v.verdict_score * v.evidence_confidence
             weighted_sum += w * score
             weight_total += w
@@ -1269,6 +1288,7 @@ class VerificationEngine:
 
     @staticmethod
     def _trust_label(score: float) -> str:
+        if score == -2.0: return "Fonti consultate — nessun valore da confrontare"
         if score < 0:     return "Dati insufficienti per una valutazione"
         if score >= 7.5:  return "Alta affidabilità"
         if score >= 5.5:  return "Affidabilità moderata"
