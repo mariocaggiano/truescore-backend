@@ -1407,12 +1407,17 @@ class NewsConnector(BaseConnector):
 
     # Query per categoria
     QUERIES = {
+        "liquidation": [
+            # Query dedicata per stato di liquidazione/scioglimento — massima priorità
+            '"{company}" liquidazione OR scioglimento OR "messa in liquidazione" OR cancellata',
+            '"{company}" "in liquidazione" OR liquidatore OR "cessazione attività"',
+        ],
         "legal": [
             '"{company}" causa OR "azione legale" OR indagine OR sequestro OR "tribunale"',
             '"{company}" sanzione OR condanna OR "procedimento penale" OR "Guardia di Finanza"',
         ],
         "financial": [
-            '"{company}" fallimento OR insolvenza OR liquidazione OR "stato di crisi"',
+            '"{company}" fallimento OR insolvenza OR "stato di crisi" OR bancarotta',
             '"{company}" "mancato pagamento" OR inadempienza OR "protesto" OR "pignoramento"',
         ],
         "reputational": [
@@ -1427,9 +1432,12 @@ class NewsConnector(BaseConnector):
 
     SEVERITY_KEYWORDS = {
         "high": ["fallimento", "condanna", "sequestro", "frode", "truffa",
-                 "arresto", "bancarotta", "penale", "reato", "indagato"],
+                 "arresto", "bancarotta", "penale", "reato", "indagato",
+                 # Liquidazione è high severity — azienda potenzialmente non operativa
+                 "in liquidazione", "messa in liquidazione", "scioglimento",
+                 "cessazione attività", "cancellata", "liquidatore"],
         "medium": ["causa", "sanzione", "multa", "indagine", "controversia",
-                   "irregolarità", "liquidazione", "protesto"],
+                   "irregolarità", "protesto", "liquidazione"],
         "low": ["discussione", "critica", "polemica", "disputa", "reclamo"],
     }
 
@@ -2102,6 +2110,181 @@ class WaybackConnector(BaseConnector):
         return metrics
 
 
+
+# ─────────────────────────────────────────────
+#  Connettore 9 — Liquidation Checker
+# ─────────────────────────────────────────────
+
+class LiquidationChecker(BaseConnector):
+    """
+    Verifica se un'azienda è in liquidazione, sciolta o cancellata.
+    
+    Strategia (in ordine):
+    1. Cerca negli snippet Google la frase "in liquidazione" / "scioglimento"
+    2. Controlla se OpenCorporates ha trovato dissolution_date o status "cessata"
+    3. Controlla se UfficioCamerale riporta stato non attivo
+    
+    Gira sempre nel baseline — risultato in result.liquidation_status.
+    """
+    
+    NAME          = "liquidation"
+    REQUEST_DELAY = 1.5
+    GOOGLE_BASE   = "https://www.google.com/search?q="
+
+    # Frasi che indicano liquidazione con certezza
+    DEFINITIVE_SIGNALS = [
+        "in liquidazione",
+        "messa in liquidazione",
+        "sciolta e messa in liquidazione",
+        "cancellata dal registro",
+        "cessazione attività",
+        "liquidazione volontaria",
+        "liquidazione giudiziale",
+        "procedura di liquidazione",
+    ]
+
+    # Frasi che suggeriscono problemi ma non certezza
+    WARNING_SIGNALS = [
+        "liquidazione",
+        "scioglimento",
+        "cessata",
+        "cancellata",
+        "non più attiva",
+        "chiusa",
+    ]
+
+    def fetch(self, claim: dict, company_name: str) -> ConnectorResult:
+        claim_id    = claim.get("id", "")
+        claim_type  = claim.get("type", "")
+        proxy_base  = claim.get("proxy_base_url", "")
+
+        cache_key = self.cache.make_key(self.NAME, company_name)
+        cached    = self.cache.get(cache_key)
+        if cached:
+            data = json.loads(cached)
+            return ConnectorResult(
+                connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+                found=data.get("is_liquidation", False),
+                data=data, confidence=data.get("confidence", 0),
+                notes=data.get("notes", "")
+            )
+
+        result_data = {
+            "is_liquidation": False,
+            "severity":       None,
+            "signals":        [],
+            "sources":        [],
+            "notes":          "",
+            "confidence":     0.0,
+        }
+
+        # ── 1. Google search via proxy ────────────────────────────────────
+        if proxy_base:
+            google_signals = self._check_google(company_name, proxy_base)
+            if google_signals:
+                result_data["signals"].extend(google_signals)
+                result_data["sources"].append("google")
+
+        # ── 2. Controlla cache OpenCorporates ─────────────────────────────
+        oc_key  = self.cache.make_key("opencorporates", company_name)
+        oc_data = self.cache.get(oc_key)
+        if oc_data:
+            try:
+                oc = json.loads(oc_data)
+                if oc.get("dissolution_date"):
+                    result_data["signals"].append(
+                        f"Data scioglimento da OpenCorporates: {oc['dissolution_date']}"
+                    )
+                    result_data["sources"].append("opencorporates")
+                if oc.get("status_normalized") in ("cessata", "inactive", "dissolved"):
+                    result_data["signals"].append(
+                        f"Stato OpenCorporates: {oc.get('status_normalized','cessata')}"
+                    )
+                    result_data["sources"].append("opencorporates")
+            except Exception:
+                pass
+
+        # ── 3. Controlla cache UfficioCamerale ────────────────────────────
+        uc_key  = self.cache.make_key("ufficiocamerale", claim.get("vat_number",""))
+        uc_data = self.cache.get(uc_key)
+        if uc_data:
+            try:
+                uc = json.loads(uc_data)
+                status = (uc.get("company_status") or "").lower()
+                if any(s in status for s in ["liquid", "sciolt", "cancel", "cessata"]):
+                    result_data["signals"].append(
+                        f"Stato UfficioCamerale: {uc.get('company_status','')}"
+                    )
+                    result_data["sources"].append("ufficiocamerale")
+            except Exception:
+                pass
+
+        # ── Valuta i segnali raccolti ─────────────────────────────────────
+        signals = result_data["signals"]
+        if signals:
+            # Controlla se ci sono segnali definitivi
+            text = " ".join(signals).lower()
+            is_definitive = any(ds in text for ds in self.DEFINITIVE_SIGNALS)
+
+            result_data["is_liquidation"] = True
+            result_data["severity"]       = "critical" if is_definitive else "warning"
+            result_data["confidence"]     = 0.90 if is_definitive else 0.65
+            result_data["notes"]          = (
+                "AZIENDA IN LIQUIDAZIONE: " if is_definitive else "POSSIBILE LIQUIDAZIONE: "
+            ) + "; ".join(signals[:3])
+
+            log.warning(
+                f"LiquidationChecker: {'LIQUIDAZIONE CONFERMATA' if is_definitive else 'segnali liquidazione'} "
+                f"per '{company_name}' — {signals[:2]}"
+            )
+
+        self.cache.set(cache_key, json.dumps(result_data))
+
+        if result_data["is_liquidation"]:
+            return ConnectorResult(
+                connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+                found=True, data=result_data,
+                confidence=result_data["confidence"],
+                notes=result_data["notes"]
+            )
+
+        return ConnectorResult(
+            connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+            found=False, data=result_data,
+            notes=f"Nessun segnale di liquidazione per '{company_name}'"
+        )
+
+    def _check_google(self, company_name: str, proxy_base: str) -> list[str]:
+        """Cerca segnali di liquidazione via Google tramite proxy."""
+        signals = []
+        query = f'"{company_name}" "in liquidazione" OR scioglimento OR "cancellata" OR "cessata"'
+        try:
+            google_url = f"{self.GOOGLE_BASE}{quote_plus(query)}&num=10"
+            proxy_url  = f"{proxy_base}/api/proxy-fetch?url={quote_plus(google_url)}"
+            resp       = self._get(proxy_url, timeout=10)
+            if resp.status_code != 200:
+                return signals
+            result = resp.json()
+            if result.get("status") != 200:
+                return signals
+
+            soup = BeautifulSoup(result.get("html", ""), "html.parser")
+            text = soup.get_text(" ", strip=True).lower()
+
+            for signal in self.DEFINITIVE_SIGNALS + self.WARNING_SIGNALS:
+                if signal in text:
+                    # Trova il contesto
+                    idx = text.find(signal)
+                    context = text[max(0,idx-30):idx+60].strip()
+                    signals.append(f'"{signal}" trovato: ...{context}...')
+                    break  # basta il primo per la cache
+
+        except Exception as e:
+            log.debug(f"LiquidationChecker Google error: {e}")
+
+        return signals
+
+
 # ─────────────────────────────────────────────
 #  Data Collector — orchestratore
 # ─────────────────────────────────────────────
@@ -2182,6 +2365,7 @@ class DataCollector:
             "opencorporates":  OpenCorporatesConnector(cache=shared_cache),
             "people_finder":   PeopleFinderConnector(cache=shared_cache),
             "news":            NewsConnector(api_key=news_api_key, cache=shared_cache),
+            "liquidation":     LiquidationChecker(cache=shared_cache),
         }
 
     def collect(
@@ -2207,7 +2391,7 @@ class DataCollector:
             "proxy_base_url":    getattr(self, "proxy_base_url", ""),
             "pitch_key_people":  pitch_kp_json,
         }
-        for name in ["opencorporates", "ufficiocamerale", "people_finder", "news"]:
+        for name in ["opencorporates", "ufficiocamerale", "people_finder", "news", "liquidation"]:
             if name == "ufficiocamerale" and not self.vat_number:
                 continue
             connector = self.connectors.get(name)
