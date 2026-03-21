@@ -2219,9 +2219,18 @@ class LiquidationChecker(BaseConnector):
             "confidence":     0.0,
         }
 
-        # ── 1. Google search via proxy ────────────────────────────────────
-        if proxy_base:
-            google_signals = self._check_google(company_name, proxy_base)
+        # ── 1. Ricerca diretta su Google site:ufficiocamerale.it ──────────
+        # Non usa il proxy (deadlock), fa richieste HTTP dirette.
+        vat_early = claim.get("vat_number", "")
+        if vat_early:
+            uc_signals = self._check_ufficiocamerale_direct(company_name, vat_early)
+            if uc_signals:
+                result_data["signals"].extend(uc_signals)
+                result_data["sources"].append("ufficiocamerale_google")
+
+        # ── 1b. Google generico se non trovato da site: search ────────────
+        if not result_data["signals"] and proxy_base:
+            google_signals = self._check_google_direct(company_name)
             if google_signals:
                 result_data["signals"].extend(google_signals)
                 result_data["sources"].append("google")
@@ -2401,11 +2410,10 @@ class LiquidationChecker(BaseConnector):
         return signals
 
 
+    def _check_google_direct(self, company_name: str) -> list[str]:
         """
         Cerca segnali di liquidazione con richieste HTTP DIRETTE a Google.
         Non usa il proxy endpoint (evita deadlock su server single-threaded).
-        Replica la logica proxy internamente: passa X-Forwarded-For per bypassare
-        i blocchi IP dei datacenter.
         """
         signals = []
 
@@ -2455,7 +2463,7 @@ class LiquidationChecker(BaseConnector):
             except Exception as e:
                 log.debug(f"LiquidationChecker Google ({query[:40]}): {e}")
 
-        # Fallback: ATOKA (database imprese pubblico italiano)
+        # Fallback: ATOKA
         if not signals:
             try:
                 url  = (f"https://atoka.io/aziende/?"
@@ -2469,10 +2477,6 @@ class LiquidationChecker(BaseConnector):
                             if signal in text:
                                 signals.append(
                                     f'ATOKA: "{signal}" per {company_name}'
-                                )
-                                log.info(
-                                    f"LiquidationChecker: trovato '{signal}' "
-                                    f"per '{company_name}' su ATOKA"
                                 )
                                 break
             except Exception as e:
