@@ -185,6 +185,10 @@ async def run_pipeline(
         await asyncio.sleep(0.1)
 
         fin = extraction.financial_data
+
+        # Cache condivisa — tutti i connettori vedono i segnali l'uno dell'altro
+        shared_cache = InMemoryCache()
+
         # Parsa HTML pre-fetchato dal browser se disponibile
         uc_prefetched_data = None
         oc_prefetched_data = None
@@ -192,23 +196,30 @@ async def run_pipeline(
         if ufficiocamerale_html and vat_number:
             try:
                 from data_collector import UfficioCameraleConnector
-                uc_conn = UfficioCameraleConnector(cache=InMemoryCache())
+                # Usa shared_cache: il segnale di liquidazione scritto qui
+                # sarà visibile al LiquidationChecker nel DataCollector
+                uc_conn = UfficioCameraleConnector(cache=shared_cache)
                 uc_prefetched_data = uc_conn.parse_html(
                     ufficiocamerale_html,
                     ufficiocamerale_url or "https://www.ufficiocamerale.it",
                     vat_number
                 )
                 if uc_prefetched_data:
+                    status = uc_prefetched_data.get("company_status", "")
                     log.info(f"[{job_id[:8]}] UfficioCamerale (client-fetch): "
                              f"ricavi={uc_prefetched_data.get('revenues')}, "
-                             f"dipendenti={uc_prefetched_data.get('employees')}")
+                             f"dipendenti={uc_prefetched_data.get('employees')}, "
+                             f"status={status}")
+                    if "liquid" in (status or "").lower():
+                        log.warning(f"[{job_id[:8]}] UfficioCamerale: LIQUIDAZIONE "
+                                    f"rilevata dall'HTML pre-fetchato")
             except Exception as e:
                 log.warning(f"[{job_id[:8]}] UfficioCamerale parse error: {e}")
 
         if opencorporates_html:
             try:
                 from data_collector import OpenCorporatesConnector
-                oc_conn = OpenCorporatesConnector(cache=InMemoryCache())
+                oc_conn = OpenCorporatesConnector(cache=shared_cache)
                 oc_prefetched_data = oc_conn.parse_html(
                     opencorporates_html,
                     "https://opencorporates.com/companies"
@@ -220,13 +231,12 @@ async def run_pipeline(
             except Exception as e:
                 log.warning(f"[{job_id[:8]}] OpenCorporates parse error: {e}")
 
-        # Determina URL base per proxy (usato da PeopleFinder per Google search)
-        request_host = "https://truescore-backend.onrender.com"  # default production
+        request_host = "https://truescore-backend.onrender.com"
 
         collector = DataCollector(
             financial_data=fin.__dict__ if fin else None,
             crunchbase_api_key=crunchbase_api_key or "",
-            cache=InMemoryCache(),
+            cache=shared_cache,
             linkedin_url=linkedin_url,
             vat_number=vat_number,
             uc_prefetched=uc_prefetched_data,
