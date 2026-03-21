@@ -729,13 +729,35 @@ class ClaimExtractor:
             return []
 
     def _extract_financial_data(self, text: str, doc_label: str) -> FinancialData | None:
-        """Estrae dati strutturati da un bilancio."""
-        # Usa solo le prime 6000 caratteri per non sforare il context
-        truncated = text[:6000]
+        """
+        Estrae dati strutturati da un bilancio.
+        Strategia doppia: prima regex veloce, poi LLM come fallback/validazione.
+        """
+        # ── Step 1: regex veloce per valori più comuni ────────────────────
+        regex_data = self._extract_financials_regex(text)
+
+        # ── Step 2: LLM su sezione rilevante del testo ───────────────────
+        # Trova la sezione del conto economico se presente
+        eco_markers = ["conto economico", "ricavi", "valore della produzione",
+                       "proventi", "fatturato", "a) ricavi"]
+        text_lower = text.lower()
+        start_idx = 0
+        for marker in eco_markers:
+            idx = text_lower.find(marker)
+            if idx > 0:
+                start_idx = max(0, idx - 200)
+                break
+
+        # Usa la sezione rilevante + inizio documento
+        relevant = text[:2000] + "\n\n...\n\n" + text[start_idx:start_idx+4000]
+        truncated = relevant[:6000]
+
         user_prompt = (
             f"Documento: {doc_label}\n\n"
             f"--- TESTO BILANCIO ---\n{truncated}\n--- FINE ---\n\n"
-            "Estrai i dati finanziari richiesti."
+            "Estrai i dati finanziari richiesti. "
+            "Se vedi numeri come '869.619' in un bilancio italiano, "
+            "significa 869619 euro (il punto è separatore migliaia)."
         )
 
         try:
@@ -744,12 +766,22 @@ class ClaimExtractor:
             if isinstance(data, list):
                 data = data[0] if data else {}
 
+            # Usa regex come fallback se LLM non trova i ricavi
+            revenues = self._to_float(data.get("revenues"))
+            if revenues is None and regex_data.get("revenues"):
+                revenues = regex_data["revenues"]
+                log.info(f"Ricavi trovati via regex: {revenues}")
+
+            employees = self._to_int(data.get("employees"))
+            if employees is None and regex_data.get("employees"):
+                employees = regex_data["employees"]
+
             return FinancialData(
                 source_document=doc_label,
-                exercise_year=data.get("exercise_year"),
-                revenues=self._to_float(data.get("revenues")),
+                exercise_year=data.get("exercise_year") or regex_data.get("year"),
+                revenues=revenues,
                 total_assets=self._to_float(data.get("total_assets")),
-                employees=self._to_int(data.get("employees")),
+                employees=employees,
                 legal_form=data.get("legal_form"),
                 share_capital=self._to_float(data.get("share_capital")),
                 extraction_confidence=float(data.get("extraction_confidence", 0.5)),
@@ -757,7 +789,75 @@ class ClaimExtractor:
             )
         except Exception as e:
             log.error(f"Errore estrazione dati finanziari: {e}")
+            # Restituisci almeno i dati da regex se disponibili
+            if regex_data:
+                return FinancialData(
+                    source_document=doc_label,
+                    revenues=regex_data.get("revenues"),
+                    employees=regex_data.get("employees"),
+                    exercise_year=regex_data.get("year"),
+                    extraction_confidence=0.4,
+                    raw_excerpt="Estratto via regex",
+                )
             return None
+
+    @staticmethod
+    def _extract_financials_regex(text: str) -> dict:
+        """
+        Estrazione veloce via regex come backup all'LLM.
+        Gestisce il formato numerico italiano (punto=migliaia, virgola=decimali).
+        """
+        result = {}
+        text_lower = text.lower()
+
+        def parse_it_number(s: str) -> Optional[float]:
+            """Converte '1.234.567' o '1.234.567,89' in float."""
+            s = s.strip().replace(" ", "")
+            # Rimuovi simbolo euro
+            s = s.replace("€", "").strip()
+            # Formato italiano: punto=migliaia, virgola=decimali
+            if "," in s:
+                parts = s.rsplit(",", 1)
+                integer_part = parts[0].replace(".", "")
+                decimal_part = parts[1] if len(parts) > 1 else "0"
+                s = integer_part + "." + decimal_part
+            else:
+                # Solo punti = separatori migliaia
+                s = s.replace(".", "")
+            try:
+                return float(s)
+            except Exception:
+                return None
+
+        # Pattern ricavi (conto economico italiano)
+        revenue_patterns = [
+            r"(?:a\)|ricavi delle vendite[^€\d]*)([\d\.]+(?:,\d+)?)",
+            r"(?:valore della produzione)[^\d]*([\d\.]+(?:,\d+)?)",
+            r"(?:totale valore della produzione)[^\d]*([\d\.]+(?:,\d+)?)",
+            r"(?:ricavi netti|fatturato)[^\d]*([\d\.]+(?:,\d+)?)",
+            r"(?:proventi totali)[^\d]*([\d\.]+(?:,\d+)?)",
+        ]
+        for pat in revenue_patterns:
+            m = re.search(pat, text_lower)
+            if m:
+                val = parse_it_number(m.group(1))
+                if val and val > 1000:  # almeno 1000€ per essere credibile
+                    result["revenues"] = val
+                    break
+
+        # Anno esercizio
+        m = re.search(r"(?:esercizio|al 31/12/|anno)\s*(20\d{2})", text_lower)
+        if m:
+            result["year"] = int(m.group(1))
+
+        # Dipendenti
+        m = re.search(r"(?:dipendenti|addetti|n\.\s*medio)[^\d]*(\d+)", text_lower)
+        if m:
+            val = int(m.group(1))
+            if 1 <= val <= 100000:
+                result["employees"] = val
+
+        return result
 
     def _deduplicate(self, claims: list[dict]) -> list[dict]:
         """Rimuove duplicati semantici usando l'LLM."""
