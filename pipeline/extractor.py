@@ -493,6 +493,13 @@ Estrai i seguenti dati se presenti:
 ATTENZIONE: i numeri nei bilanci italiani usano il punto come separatore delle migliaia
 (es. 1.234.567 = un milione duecentotrentaquattromila). Converti sempre in intero senza punti.
 
+FORMATO GESTIONALE (due colonne separate da |):
+Se il testo ha formato "COSTI Eur|RICAVI Eur" con righe tipo:
+  "801 RICAVI ALLA LET.A)E B)ART.85______A1 649,04"
+  "803 RICAVI PER PRESTAZIONI SERVIZI____A1 5.500,00"
+  "809 ALTRI PROVENTI CONSIDERATI RICAVI 50.000,00"
+Somma TUTTI i valori delle righe ricavi (801, 803, 809 etc.) per ottenere il totale.
+
 Rispondi SOLO con un oggetto JSON valido con queste chiavi esatte.
 Se un dato non è presente nel testo, usa null.
 Nessun testo prima o dopo il JSON.
@@ -837,13 +844,36 @@ class ClaimExtractor:
             r"(?:ricavi netti|fatturato)[^\d]*([\d\.]+(?:,\d+)?)",
             r"(?:proventi totali)[^\d]*([\d\.]+(?:,\d+)?)",
         ]
+
+        # Pattern specifici per formato gestionale (due colonne separate da |)
+        # Es: "801 RICAVI ALLA LET.A)E B)ART.85______A1 649,04"
+        # Es: "803 RICAVI PER PRESTAZIONI SERVIZI____A1 5.500,00"
+        gestionale_patterns = [
+            r"8\d{2}\s+RICAVI[^\|]*?([\d\.]+,\d{2})",
+            r"ricavi per prestazioni[^\|]*?([\d\.]+,\d{2})",
+            r"ricavi alla let[^\|]*?([\d\.]+,\d{2})",
+            r"altri proventi considerati ricavi[^\|]*?([\d\.]+,\d{2})",
+        ]
+
+        # Prova i pattern standard
         for pat in revenue_patterns:
             m = re.search(pat, text_lower)
             if m:
                 val = parse_it_number(m.group(1))
-                if val and val > 1000:  # almeno 1000€ per essere credibile
+                if val and val > 1000:
                     result["revenues"] = val
                     break
+
+        # Se non trovato, prova formato gestionale e somma tutte le voci ricavi
+        if not result.get("revenues"):
+            total_revenues = 0.0
+            for pat in gestionale_patterns:
+                for m in re.finditer(pat, text_lower):
+                    val = parse_it_number(m.group(1))
+                    if val and val > 0:
+                        total_revenues += val
+            if total_revenues > 0:
+                result["revenues"] = total_revenues
 
         # Anno esercizio
         m = re.search(r"(?:esercizio|al 31/12/|anno)\s*(20\d{2})", text_lower)
