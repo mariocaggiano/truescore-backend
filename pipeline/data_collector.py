@@ -2277,6 +2277,15 @@ class LiquidationChecker(BaseConnector):
             except Exception:
                 pass
 
+        # ── 4. Ricerca diretta site:ufficiocamerale.it ────────────────────
+        # Google è inconsistente. Cerchiamo direttamente l'URL della pagina
+        # su ufficiocamerale cercando per nome + P.IVA.
+        if not result_data["signals"] and vat:
+            uc_signals = self._check_ufficiocamerale_direct(company_name, vat)
+            if uc_signals:
+                result_data["signals"].extend(uc_signals)
+                result_data["sources"].append("ufficiocamerale_direct")
+
         # ── Valuta i segnali raccolti ─────────────────────────────────────
         signals = result_data["signals"]
         if signals:
@@ -2312,7 +2321,86 @@ class LiquidationChecker(BaseConnector):
             notes=f"Nessun segnale di liquidazione per '{company_name}'"
         )
 
-    def _check_google(self, company_name: str, proxy_base: str) -> list[str]:
+    def _check_ufficiocamerale_direct(self, company_name: str, vat_number: str) -> list[str]:
+        """
+        Cerca direttamente su ufficiocamerale.it tramite Google site: search.
+        Più affidabile del Google generico perché usa site:ufficiocamerale.it
+        e cerca per P.IVA — identifica univocamente l'azienda.
+        """
+        signals = []
+        headers = {
+            "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                               "AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+            "Accept-Language": "it-IT,it;q=0.9",
+            "Referer":         "https://www.google.it/",
+        }
+
+        # Query 1: site:ufficiocamerale.it + P.IVA (molto precisa)
+        queries = [
+            f"site:ufficiocamerale.it {vat_number}",
+            f"site:ufficiocamerale.it {company_name} liquidazione",
+        ]
+
+        for query in queries:
+            try:
+                url  = f"https://www.google.com/search?q={quote_plus(query)}&num=5&hl=it"
+                resp = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+                if resp.status_code != 200:
+                    time.sleep(self.REQUEST_DELAY)
+                    continue
+
+                soup = BeautifulSoup(resp.text, "html.parser")
+
+                # Cerca URL nei risultati che contengono slug significativi
+                for a in soup.select("a[href]"):
+                    href = a.get("href", "")
+                    if "ufficiocamerale.it" not in href:
+                        continue
+                    href_lower = href.lower()
+                    for signal in self.DEFINITIVE_SIGNALS:
+                        signal_slug = signal.replace(" ", "-")
+                        if signal_slug in href_lower or signal in href_lower:
+                            signals.append(
+                                f"UfficioCamerale (Google site:): "
+                                f"URL contiene '{signal_slug}' — {href[:100]}"
+                            )
+                            log.info(
+                                f"LiquidationChecker: '{signal}' nell'URL "
+                                f"ufficiocamerale per '{company_name}'"
+                            )
+                            # Salva anche in cache per il secondo passaggio
+                            liq_key = self.cache.make_key(
+                                "liquidation_url_signal", vat_number
+                            )
+                            import json as _json
+                            self.cache.set(liq_key, _json.dumps({
+                                "signal": f"{signal_slug} (da Google site:)",
+                                "url":    href[:200],
+                                "vat_number": vat_number,
+                                "company":    company_name,
+                            }))
+                            return signals
+
+                # Cerca anche nel testo degli snippet
+                text = soup.get_text(" ", strip=True).lower()
+                if "ufficiocamerale" in text:
+                    for signal in self.DEFINITIVE_SIGNALS:
+                        if signal in text:
+                            idx     = text.find(signal)
+                            context = text[max(0, idx-30):idx+60].strip()
+                            signals.append(
+                                f"UfficioCamerale snippet: '{signal}' — ...{context[:60]}..."
+                            )
+                            return signals
+
+                time.sleep(self.REQUEST_DELAY)
+
+            except Exception as e:
+                log.debug(f"LiquidationChecker UC direct ({query[:40]}): {e}")
+
+        return signals
+
+
         """
         Cerca segnali di liquidazione con richieste HTTP DIRETTE a Google.
         Non usa il proxy endpoint (evita deadlock su server single-threaded).
