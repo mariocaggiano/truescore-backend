@@ -1101,6 +1101,51 @@ class NewsEnricher:
         return " ".join(parts)
 
 
+class LiquidationEnricher:
+    @staticmethod
+    def enrich(result, raw_results):
+        liq = [r for r in raw_results if r.get('connector')=='liquidation' and r.get('found')]
+        if not liq:
+            return
+        data     = liq[0].get('data', {})
+        severity = data.get('severity', 'warning')
+        signals  = data.get('signals', [])
+        notes    = data.get('notes', '')
+        if not signals:
+            return
+
+        # Inietta in legal_status
+        flag = {'severity': severity, 'text': notes or '; '.join(signals[:2])}
+        if result.legal_status and result.legal_status.get('found'):
+            result.legal_status.setdefault('flags', []).insert(0, flag)
+        else:
+            result.legal_status = {
+                'found': True, 'name': result.company_name,
+                'company_type': '', 'company_number': '',
+                'incorporation_date': None, 'dissolution_date': None,
+                'current_status': 'liquidazione',
+                'status_normalized': 'liquidazione',
+                'status_label': 'In Liquidazione (rilevato da fonti web)',
+                'registered_address': '', 'previous_names': [],
+                'opencorporates_url': '', 'registry_url': '',
+                'flags': [flag], 'source': 'liquidation_checker',
+            }
+
+        # Red flag visibile
+        result.red_flags.append(type('LiqFlag', (), {
+            'claim_id': 'LIQUIDATION', 'claim_type': 'legal_status',
+            'verdict': type('V', (), {'value': 'discrepancy'})(),
+            'claim_text': (notes or 'Segnali di liquidazione')[:150],
+            'declared_value': None, 'verified_value': None,
+            'magnitude': None,
+            'reasoning': 'Fonte: ' + ', '.join(data.get('sources', [])),
+            'evidence_confidence': data.get('confidence', 0.7),
+            'sources_used': data.get('sources', []),
+            'sources_consulted': [],
+        })())
+        log.warning(f'LiquidationEnricher: flag [{severity}] per {result.company_name}')
+
+
 class OtherVerifier(BaseVerifier):
     """Catch-all per tipi di claim non gestiti."""
 
@@ -1217,6 +1262,9 @@ class VerificationEngine:
 
         # ── Arricchisci con news red flags ────────────────────────────────
         NewsEnricher.enrich(result, raw_results)
+
+        # ── Verifica liquidazione ─────────────────────────────────────────
+        LiquidationEnricher.enrich(result, raw_results)
 
         # ── Calcola Trust Score ───────────────────────────────────────────
         result.trust_score = self._compute_trust_score(result.verdicts)
