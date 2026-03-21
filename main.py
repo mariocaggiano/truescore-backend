@@ -222,6 +222,7 @@ async def run_pipeline(
             uc_prefetched=uc_prefetched_data,
             oc_prefetched=oc_prefetched_data,
             proxy_base_url=request_host,
+            pitch_key_people=extraction.key_people,
         )
 
         collection = collector.collect(
@@ -496,6 +497,8 @@ async def proxy_fetch(
     allowed_domains = [
         "ufficiocamerale.it",
         "opencorporates.com",
+        "www.google.com",       # per ricerche LinkedIn profile via PeopleFinder
+        "google.com",
     ]
     if not any(d in url for d in allowed_domains):
         raise HTTPException(400, "Dominio non autorizzato")
