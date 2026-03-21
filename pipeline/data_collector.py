@@ -1380,6 +1380,194 @@ class OpenCorporatesConnector(BaseConnector):
         }
 
 
+
+# ─────────────────────────────────────────────
+#  Connettore 8 — News Red Flags (NewsAPI)
+# ─────────────────────────────────────────────
+
+class NewsConnector(BaseConnector):
+    """
+    Cerca menzioni negative dell'azienda su fonti giornalistiche.
+    Usa NewsAPI free tier (100 req/giorno, nessuna carta di credito).
+
+    Registrazione gratuita: https://newsapi.org/register
+
+    Cerca segnali di rischio in 4 categorie:
+    - LEGAL:      cause legali, indagini, sequestri, sanzioni
+    - FINANCIAL:  fallimento, insolvenza, liquidazione, mancati pagamenti
+    - REPUTATIONAL: scandali, frodi, truffe, controversie
+    - REGULATORY: violazioni normative, multe, revoche licenze
+
+    Per ogni articolo trovato: titolo, fonte, data, URL, categoria, severity.
+    """
+
+    NAME     = "news"
+    BASE_URL = "https://newsapi.org/v2/everything"
+    REQUEST_DELAY = 1.0
+
+    # Query per categoria
+    QUERIES = {
+        "legal": [
+            '"{company}" causa OR "azione legale" OR indagine OR sequestro OR "tribunale"',
+            '"{company}" sanzione OR condanna OR "procedimento penale" OR "Guardia di Finanza"',
+        ],
+        "financial": [
+            '"{company}" fallimento OR insolvenza OR liquidazione OR "stato di crisi"',
+            '"{company}" "mancato pagamento" OR inadempienza OR "protesto" OR "pignoramento"',
+        ],
+        "reputational": [
+            '"{company}" frode OR truffa OR scandalo OR controversia OR "denuncia"',
+            '"{company}" "raggiro" OR "ingannato" OR "frodato" OR "truffato"',
+        ],
+        "regulatory": [
+            '"{company}" multa OR "violazione" OR "Antitrust" OR AGCM OR CONSOB',
+            '"{company}" "revoca" OR "sospensione licenza" OR "irregolarità"',
+        ],
+    }
+
+    SEVERITY_KEYWORDS = {
+        "high": ["fallimento", "condanna", "sequestro", "frode", "truffa",
+                 "arresto", "bancarotta", "penale", "reato", "indagato"],
+        "medium": ["causa", "sanzione", "multa", "indagine", "controversia",
+                   "irregolarità", "liquidazione", "protesto"],
+        "low": ["discussione", "critica", "polemica", "disputa", "reclamo"],
+    }
+
+    def __init__(self, api_key: str = "", **kwargs):
+        super().__init__(**kwargs)
+        self.api_key = api_key
+
+    def fetch(self, claim: dict, company_name: str) -> ConnectorResult:
+        claim_id   = claim.get("id", "")
+        claim_type = claim.get("type", "")
+
+        if not self.api_key:
+            return ConnectorResult(
+                connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+                found=False, notes="NEWS_API_KEY non configurata"
+            )
+
+        cache_key = self.cache.make_key(self.NAME, company_name)
+        cached = self.cache.get(cache_key)
+        if cached:
+            data = json.loads(cached)
+            found = len(data.get("articles", [])) > 0
+            return ConnectorResult(
+                connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+                found=found, data=data, confidence=0.85,
+                notes=f"Da cache: {len(data.get('articles',[]))} articoli"
+            )
+
+        all_articles = []
+        categories_found = set()
+
+        for category, queries in self.QUERIES.items():
+            for query_template in queries[:1]:   # 1 query per categoria = 4 totali
+                query = query_template.format(company=company_name)
+                articles = self._search(query, category)
+                if articles:
+                    all_articles.extend(articles)
+                    categories_found.add(category)
+                time.sleep(self.REQUEST_DELAY)
+
+        # Deduplicazione per URL
+        seen_urls = set()
+        unique = []
+        for a in all_articles:
+            if a["url"] not in seen_urls:
+                seen_urls.add(a["url"])
+                unique.append(a)
+
+        # Ordina per severity poi per data
+        severity_order = {"high": 0, "medium": 1, "low": 2, "unknown": 3}
+        unique.sort(key=lambda a: (severity_order.get(a.get("severity","unknown"), 3),
+                                   a.get("published_at","") or ""), reverse=False)
+        unique = unique[:20]   # max 20 articoli
+
+        data = {
+            "articles":          unique,
+            "total_found":       len(unique),
+            "categories_found":  list(categories_found),
+            "high_severity":     [a for a in unique if a.get("severity") == "high"],
+            "medium_severity":   [a for a in unique if a.get("severity") == "medium"],
+            "company":           company_name,
+            "source":            "newsapi",
+        }
+
+        self.cache.set(cache_key, json.dumps(data))
+
+        if unique:
+            high_count = len(data["high_severity"])
+            log.info(f"NewsAPI: {len(unique)} articoli trovati per '{company_name}' "
+                     f"({high_count} alta gravità, categorie: {list(categories_found)})")
+            return ConnectorResult(
+                connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+                found=True, data=data, confidence=0.85,
+                notes=f"{len(unique)} articoli, {high_count} alta gravità"
+            )
+
+        log.info(f"NewsAPI: nessun articolo negativo trovato per '{company_name}'")
+        self.cache.set(cache_key, json.dumps(data))
+        return ConnectorResult(
+            connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+            found=False, data=data,
+            notes=f"Nessuna menzione negativa trovata per '{company_name}'"
+        )
+
+    def _search(self, query: str, category: str) -> list[dict]:
+        """Chiama NewsAPI e restituisce articoli strutturati."""
+        try:
+            resp = self._get(
+                self.BASE_URL,
+                params={
+                    "q":        query,
+                    "language": "it",
+                    "sortBy":   "relevancy",
+                    "pageSize": 5,
+                    "apiKey":   self.api_key,
+                },
+                timeout=10,
+            )
+            if resp.status_code == 426:
+                log.warning("NewsAPI: piano free richiede registrazione")
+                return []
+            if resp.status_code == 429:
+                log.warning("NewsAPI: rate limit raggiunto")
+                return []
+            resp.raise_for_status()
+
+            raw = resp.json().get("articles", [])
+            articles = []
+            for a in raw:
+                title       = a.get("title", "") or ""
+                description = a.get("description", "") or ""
+                combined    = (title + " " + description).lower()
+
+                severity = self._detect_severity(combined)
+
+                articles.append({
+                    "title":        title[:200],
+                    "description":  description[:300],
+                    "source":       a.get("source", {}).get("name", ""),
+                    "url":          a.get("url", ""),
+                    "published_at": a.get("publishedAt", "")[:10],
+                    "category":     category,
+                    "severity":     severity,
+                })
+            return articles
+
+        except Exception as e:
+            log.warning(f"NewsAPI error per query '{query[:50]}': {e}")
+            return []
+
+    def _detect_severity(self, text: str) -> str:
+        """Classifica la gravità dell'articolo in base alle parole chiave."""
+        for severity, keywords in self.SEVERITY_KEYWORDS.items():
+            if any(kw in text for kw in keywords):
+                return severity
+        return "low"
+
+
 # ─────────────────────────────────────────────
 #  Connettore 7 — People Finder
 # ─────────────────────────────────────────────
@@ -1960,6 +2148,7 @@ class DataCollector:
         oc_prefetched: Optional[dict] = None,   # dati OpenCorporates pre-parsati dal browser
         proxy_base_url: str = "",               # URL del backend per proxy fetch
         pitch_key_people: list = None,          # persone chiave estratte dal pitch deck
+        news_api_key: str = "",                 # NewsAPI free tier key
     ):
         shared_cache = cache or InMemoryCache()
         self.linkedin_url    = linkedin_url.strip()
@@ -1968,6 +2157,7 @@ class DataCollector:
         self.oc_prefetched   = oc_prefetched
         self.proxy_base_url  = proxy_base_url.strip()
         self.pitch_key_people = pitch_key_people or []
+        self.news_api_key = news_api_key.strip()
 
         # Pre-popola la cache con i dati già ottenuti dal browser
         if uc_prefetched:
@@ -1991,6 +2181,7 @@ class DataCollector:
             "wayback":         WaybackConnector(cache=shared_cache),
             "opencorporates":  OpenCorporatesConnector(cache=shared_cache),
             "people_finder":   PeopleFinderConnector(cache=shared_cache),
+            "news":            NewsConnector(api_key=news_api_key, cache=shared_cache),
         }
 
     def collect(
@@ -2016,7 +2207,7 @@ class DataCollector:
             "proxy_base_url":    getattr(self, "proxy_base_url", ""),
             "pitch_key_people":  pitch_kp_json,
         }
-        for name in ["opencorporates", "ufficiocamerale", "people_finder"]:
+        for name in ["opencorporates", "ufficiocamerale", "people_finder", "news"]:
             if name == "ufficiocamerale" and not self.vat_number:
                 continue
             connector = self.connectors.get(name)
