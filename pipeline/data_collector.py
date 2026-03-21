@@ -1366,6 +1366,317 @@ class OpenCorporatesConnector(BaseConnector):
             "source":             "opencorporates",
         }
 
+
+# ─────────────────────────────────────────────
+#  Connettore 7 — People Finder
+# ─────────────────────────────────────────────
+
+class PeopleFinderConnector(BaseConnector):
+    """
+    Trova le persone chiave di un'azienda (fondatori, C-suite, responsabili)
+    combinando ricerche Google e LinkedIn pubblico.
+
+    Strategia multi-sorgente:
+    1. Google search "[azienda] CEO fondatore" → estrae nomi e ruoli da snippet
+    2. Google search "[azienda] site:linkedin.com/in" → profili LinkedIn individuali
+    3. Pagina /about o /team sul sito aziendale se disponibile
+
+    Non richiede API key. Funziona anche con 0 claim.
+    Produce una lista strutturata di persone con nome, ruolo, fonte e URL.
+    """
+
+    NAME          = "people_finder"
+    REQUEST_DELAY = 2.0
+    GOOGLE_BASE   = "https://www.google.com/search?q="
+
+    # Ruoli da cercare in italiano e inglese
+    ROLES = [
+        "CEO", "fondatore", "founder", "co-founder", "cofondatore",
+        "CFO", "COO", "CMO", "CTO", "direttore generale",
+        "managing director", "presidente", "vicepresidente",
+        "head of", "responsabile", "partner", "board",
+    ]
+
+    def fetch(self, claim: dict, company_name: str) -> ConnectorResult:
+        claim_id = claim.get("id", "")
+        claim_type = claim.get("type", "")
+        website_url = claim.get("website_url", "").strip().rstrip("/")
+
+        cache_key = self.cache.make_key(self.NAME, company_name)
+        cached = self.cache.get(cache_key)
+        if cached:
+            data = json.loads(cached)
+            return ConnectorResult(
+                connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+                found=bool(data.get("people")),
+                data=data, confidence=0.70,
+                notes=f"Da cache: {len(data.get('people',[]))} persone"
+            )
+
+        people  = []
+        sources = []
+
+        # ── Sorgente 1: Google ricerca diretta ───────────────────────────
+        google_people = self._search_google_people(company_name)
+        people.extend(google_people)
+        if google_people:
+            sources.append("google_search")
+
+        # ── Sorgente 2: LinkedIn profiles via Google ──────────────────────
+        li_people = self._search_linkedin_profiles(company_name)
+        # Aggiungi solo se non duplica
+        for p in li_people:
+            if not any(self._same_person(p, existing) for existing in people):
+                people.append(p)
+        if li_people:
+            sources.append("linkedin_google")
+
+        # ── Sorgente 3: pagina /team o /about del sito ────────────────────
+        if website_url:
+            site_people = self._scrape_team_page(website_url)
+            for p in site_people:
+                if not any(self._same_person(p, existing) for existing in people):
+                    people.append(p)
+            if site_people:
+                sources.append("website_team_page")
+
+        # Ordina per rilevanza: C-suite prima
+        people = self._rank_people(people)[:15]  # max 15
+
+        data = {
+            "people":  people,
+            "sources": sources,
+            "company": company_name,
+            "count":   len(people),
+        }
+
+        self.cache.set(cache_key, json.dumps(data))
+
+        if people:
+            return ConnectorResult(
+                connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+                found=True, data=data, confidence=0.70,
+                notes=f"{len(people)} persone trovate ({', '.join(sources)})"
+            )
+
+        return ConnectorResult(
+            connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
+            found=False,
+            notes=f"Nessuna persona chiave trovata per '{company_name}'"
+        )
+
+    def _search_google_people(self, company_name: str) -> list[dict]:
+        """Cerca persone chiave via Google snippet."""
+        people = []
+        queries = [
+            f'"{company_name}" CEO OR fondatore OR founder OR "managing director"',
+            f'"{company_name}" CFO OR COO OR CTO OR CMO OR direttore',
+        ]
+        for query in queries:
+            try:
+                time.sleep(self.REQUEST_DELAY)
+                url  = f"{self.GOOGLE_BASE}{quote_plus(query)}&num=10"
+                resp = self._get(url, timeout=10)
+                if resp.status_code != 200:
+                    continue
+                soup = BeautifulSoup(resp.text, "html.parser")
+                people.extend(self._extract_people_from_soup(soup, company_name))
+            except Exception as e:
+                log.debug(f"PeopleFinder Google: {e}")
+        return people
+
+    def _search_linkedin_profiles(self, company_name: str) -> list[dict]:
+        """Cerca profili LinkedIn individuali via Google."""
+        people = []
+        try:
+            time.sleep(self.REQUEST_DELAY)
+            query = f'site:linkedin.com/in "{company_name}"'
+            url   = f"{self.GOOGLE_BASE}{quote_plus(query)}&num=10"
+            resp  = self._get(url, timeout=10)
+            if resp.status_code != 200:
+                return people
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            for result in soup.select("div.g, [data-sokoban-container]"):
+                title_tag   = result.select_one("h3")
+                link_tag    = result.select_one("a[href*='linkedin.com/in']")
+                snippet_tag = result.select_one("div.VwiC3b, span.aCOpRe")
+
+                if not title_tag:
+                    continue
+
+                title   = title_tag.get_text(strip=True)
+                snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
+                li_url  = ""
+
+                if link_tag:
+                    href = link_tag.get("href", "")
+                    m = re.search(r"linkedin\.com/in/[a-zA-Z0-9_-]+", href)
+                    if m:
+                        li_url = "https://www." + m.group(0)
+
+                # Estrai nome e ruolo dal titolo LinkedIn
+                # Formato tipico: "Nome Cognome - Ruolo presso Azienda | LinkedIn"
+                person = self._parse_linkedin_title(title, snippet, company_name, li_url)
+                if person:
+                    people.append(person)
+
+        except Exception as e:
+            log.debug(f"PeopleFinder LinkedIn Google: {e}")
+        return people
+
+    def _scrape_team_page(self, base_url: str) -> list[dict]:
+        """Scrapa la pagina /team o /about del sito aziendale."""
+        people = []
+        slugs  = ["/team", "/about", "/chi-siamo", "/about-us",
+                  "/management", "/leadership", "/founders"]
+
+        for slug in slugs[:4]:
+            url = base_url + slug
+            try:
+                time.sleep(1.0)
+                resp = self._get(url, timeout=6)
+                if resp.status_code != 200:
+                    continue
+
+                soup = BeautifulSoup(resp.text, "html.parser")
+                text = soup.get_text(" ", strip=True)
+
+                # Cerca pattern "Nome Cognome, Ruolo"
+                for pattern in [
+                    r"([A-Z][a-zA-Zàèéìòù]+ [A-Z][a-zA-Zàèéìòù]+)[,\s]+(" + "|".join(self.ROLES) + r")",
+                    r"(" + "|".join(self.ROLES) + r")[:\s]+([A-Z][a-zA-Zàèéìòù]+ [A-Z][a-zA-Zàèéìòù]+)",
+                ]:
+                    for m in re.finditer(pattern, text, re.IGNORECASE):
+                        groups = m.groups()
+                        name = groups[0] if groups[0][0].isupper() else groups[1]
+                        role = groups[1] if groups[0][0].isupper() else groups[0]
+                        if len(name.split()) >= 2:
+                            people.append({
+                                "name":   name.title(),
+                                "role":   role.strip(),
+                                "source": "website_team_page",
+                                "url":    url,
+                                "confidence": 0.65,
+                            })
+
+                if people:
+                    break
+
+            except Exception:
+                continue
+
+        return people
+
+    def _extract_people_from_soup(self, soup, company_name: str) -> list[dict]:
+        """Estrae nomi e ruoli dagli snippet Google."""
+        people = []
+        company_lower = company_name.lower()
+
+        for result in soup.select("div.g, [data-sokoban-container]"):
+            snippet_tag = result.select_one("div.VwiC3b, span.aCOpRe, div[style*='webkit']")
+            title_tag   = result.select_one("h3")
+            link_tag    = result.select_one("a[href]")
+
+            title   = title_tag.get_text(strip=True) if title_tag else ""
+            snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
+            url     = link_tag.get("href","") if link_tag else ""
+
+            combined = title + " " + snippet
+            if company_lower not in combined.lower():
+                continue
+
+            # Pattern: "Nome Cognome, CEO di Azienda" o "Azienda: Nome Cognome (Ruolo)"
+            patterns = [
+                r"([A-Z][a-zA-Zàèéìòù]{1,20} [A-Z][a-zA-Zàèéìòù]{1,20})[,\s]+(" + "|".join(self.ROLES) + r")",
+                r"(" + "|".join(self.ROLES) + r")[:\s]+([A-Z][a-zA-Zàèéìòù]{1,20} [A-Z][a-zA-Zàèéìòù]{1,20})",
+            ]
+
+            for pat in patterns:
+                for m in re.finditer(pat, combined, re.IGNORECASE):
+                    g = m.groups()
+                    name = g[0] if g[0][0].isupper() and len(g[0].split()) >= 2 else g[1]
+                    role = g[1] if g[0][0].isupper() and len(g[0].split()) >= 2 else g[0]
+                    if len(name.split()) < 2:
+                        continue
+                    people.append({
+                        "name":       name.strip(),
+                        "role":       role.strip().title(),
+                        "source":     "google_snippet",
+                        "url":        url if "linkedin.com" not in url else "",
+                        "linkedin":   url if "linkedin.com/in" in url else "",
+                        "confidence": 0.65,
+                    })
+
+        return people
+
+    def _parse_linkedin_title(self, title: str, snippet: str, company_name: str, li_url: str) -> Optional[dict]:
+        """Parsa il titolo di un risultato LinkedIn."""
+        # Formato: "Nome Cognome - Ruolo presso Azienda | LinkedIn"
+        title_clean = re.sub(r"\s*\|.*$", "", title).strip()
+        parts = re.split(r"\s+-\s+", title_clean)
+
+        if len(parts) < 2:
+            return None
+
+        name = parts[0].strip()
+        role_company = parts[1].strip()
+
+        # Verifica che sia almeno nome + cognome
+        if len(name.split()) < 2:
+            return None
+
+        # Estrai ruolo (prima di "presso" o "at" o "@")
+        role = re.split(r"\s+(?:presso|at|@|·)\s+", role_company, maxsplit=1)[0].strip()
+        if not role:
+            role = role_company[:60]
+
+        # Verifica rilevanza per l'azienda
+        company_words = set(company_name.lower().split())
+        context = (role_company + " " + snippet).lower()
+        if not any(w in context for w in company_words if len(w) > 3):
+            return None
+
+        return {
+            "name":       name,
+            "role":       role,
+            "source":     "linkedin",
+            "url":        li_url,
+            "linkedin":   li_url,
+            "confidence": 0.80,
+        }
+
+    @staticmethod
+    def _same_person(a: dict, b: dict) -> bool:
+        """Verifica se due entry si riferiscono alla stessa persona."""
+        name_a = a.get("name","").lower().strip()
+        name_b = b.get("name","").lower().strip()
+        if not name_a or not name_b:
+            return False
+        # Match esatto o per cognome
+        if name_a == name_b:
+            return True
+        parts_a = name_a.split()
+        parts_b = name_b.split()
+        if parts_a and parts_b and parts_a[-1] == parts_b[-1]:
+            return True
+        return False
+
+    @staticmethod
+    def _rank_people(people: list[dict]) -> list[dict]:
+        """Ordina: C-suite e fondatori prima, poi per confidence."""
+        priority = ["ceo","founder","fondatore","co-founder","cofondatore",
+                    "presidente","managing director","cfo","coo","cto","cmo"]
+
+        def score(p):
+            role = p.get("role","").lower()
+            rank = next((i for i, r in enumerate(priority) if r in role), 99)
+            return (rank, -p.get("confidence", 0))
+
+        return sorted(people, key=score)
+
+
 # ─────────────────────────────────────────────
 #  Connettore 5 — Wayback Machine
 # ─────────────────────────────────────────────
@@ -1589,6 +1900,7 @@ class DataCollector:
             "ufficiocamerale": UfficioCameraleConnector(cache=shared_cache),
             "wayback":         WaybackConnector(cache=shared_cache),
             "opencorporates":  OpenCorporatesConnector(cache=shared_cache),
+            "people_finder":   PeopleFinderConnector(cache=shared_cache),
         }
 
     def collect(
@@ -1609,7 +1921,7 @@ class DataCollector:
             "website_url":      website_url,
             "vat_number":       self.vat_number,
         }
-        for name in ["opencorporates", "ufficiocamerale"]:
+        for name in ["opencorporates", "ufficiocamerale", "people_finder"]:
             if name == "ufficiocamerale" and not self.vat_number:
                 continue
             connector = self.connectors.get(name)
