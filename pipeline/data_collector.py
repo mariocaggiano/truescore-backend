@@ -1100,8 +1100,23 @@ class OpenCorporatesConnector(BaseConnector):
         claim_type = claim.get("type", "")
 
         # Esegui una volta sola per azienda — usa cache aggressiva
-        cache_key = self.cache.make_key(self.NAME, company_name)
-        cached = self.cache.get(cache_key)
+        # Prova più varianti della cache key (pre-fetch può usare nome diverso)
+        cache_variants = [
+            company_name,
+            company_name.lower(),
+            company_name.upper(),
+            re.sub(r"\b(s\.?r\.?l\.?|s\.?p\.?a\.?|srl|spa)\b", "", company_name, flags=re.IGNORECASE).strip(),
+        ]
+        cached = None
+        used_key = None
+        for variant in cache_variants:
+            k = self.cache.make_key(self.NAME, variant)
+            c = self.cache.get(k)
+            if c:
+                cached = c
+                used_key = k
+                break
+
         if cached:
             data = json.loads(cached)
             if data:
@@ -1115,6 +1130,7 @@ class OpenCorporatesConnector(BaseConnector):
                 connector=self.NAME, claim_id=claim_id, claim_type=claim_type,
                 found=False, notes="Azienda non trovata (da cache)"
             )
+        cache_key = self.cache.make_key(self.NAME, company_name)
 
         data = self._search_company(company_name)
 
@@ -1558,10 +1574,12 @@ class DataCollector:
             shared_cache.set(cache_key, json.dumps(uc_prefetched))
             log.info(f"DataCollector: UfficioCamerale pre-fetchato caricato in cache")
         if oc_prefetched:
-            # Usa company_name come chiave — verrà trovato al primo fetch
-            cache_key = shared_cache.make_key("opencorporates", oc_prefetched.get("name",""))
-            shared_cache.set(cache_key, json.dumps(oc_prefetched))
-            log.info(f"DataCollector: OpenCorporates pre-fetchato caricato in cache ({oc_prefetched.get('name','')})")
+            oc_name = oc_prefetched.get("name", "")
+            stripped = re.sub(r"s[.]?r[.]?l[.]?|s[.]?p[.]?a[.]?|srl|spa|snc|sas", "", oc_name, flags=re.IGNORECASE).strip()
+            for kv in set([oc_name, oc_name.lower(), stripped, stripped.title(), stripped.lower()]):
+                if kv:
+                    shared_cache.set(shared_cache.make_key("opencorporates", kv), json.dumps(oc_prefetched))
+            log.info(f"DataCollector: OpenCorporates pre-fetchato in cache ({oc_name})")
 
         self.connectors: dict[str, BaseConnector] = {
             "bilancio":        BilancioConnector(financial_data=financial_data, cache=shared_cache),
@@ -1581,6 +1599,29 @@ class DataCollector:
     ) -> CollectionResult:
 
         collection = CollectionResult(company_name=company_name)
+
+        # ── Baseline: OpenCorporates e UfficioCamerale girano SEMPRE ─────────
+        # Servono per la sezione Stato Legale anche quando ci sono 0 claim.
+        baseline_claim = {
+            "id":               "BASELINE_LEGAL",
+            "type":             "other",
+            "normalized_value": None,
+            "website_url":      website_url,
+            "vat_number":       self.vat_number,
+        }
+        for name in ["opencorporates", "ufficiocamerale"]:
+            if name == "ufficiocamerale" and not self.vat_number:
+                continue
+            connector = self.connectors.get(name)
+            if not connector:
+                continue
+            try:
+                result = connector.fetch(baseline_claim, company_name)
+                status = "trovato" if result.found else "non trovato"
+                log.info(f"[{name}] baseline legal: {status}")
+                collection.results.append(result)
+            except Exception as e:
+                log.error(f"[{name}] baseline error: {e}")
 
         for claim in claims:
             # Converti in dict se è un dataclass
@@ -1607,8 +1648,9 @@ class DataCollector:
             if website_url and "wayback" not in connector_names:
                 connector_names.append("wayback")
 
-            # OpenCorporates: sempre (cerca per nome, non richiede altri input)
-            if "opencorporates" not in connector_names:
+            # OpenCorporates: solo se non già eseguito nel baseline
+            oc_already_run = any(r.connector == "opencorporates" for r in collection.results)
+            if not oc_already_run and "opencorporates" not in connector_names:
                 connector_names.append("opencorporates")
 
             # UfficioCamerale: solo se c'è la P.IVA
