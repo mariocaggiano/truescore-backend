@@ -110,6 +110,7 @@ class VerificationResult:
     job_postings: Optional[dict]      = None   # job postings LinkedIn
     email_domain: Optional[dict]      = None   # verifica DNS email
     tech_stack: Optional[dict]        = None   # tecnologie sito web
+    tone_analysis: Optional[dict]     = None   # analisi tono pitch deck
 
     def summary(self) -> str:
         lines = [
@@ -145,6 +146,7 @@ class VerificationResult:
             "job_postings": self.job_postings,
             "email_domain": self.email_domain,
             "tech_stack":   self.tech_stack,
+            "tone_analysis": self.tone_analysis,
             "errors": self.errors,
         }
 
