@@ -933,12 +933,60 @@ class UfficioCameraleConnector(BaseConnector):
     def parse_html(self, html: str, page_url: str, vat_number: str) -> Optional[dict]:
         """
         Parsa HTML pre-fetchato dal browser client.
-        Chiamato quando il backend riceve HTML già scaricato lato client.
+        Se è una pagina di ricerca, segue il link all'azienda.
+        Intercetta anche segnali di liquidazione dall'URL slug.
         """
         try:
             from bs4 import BeautifulSoup as BS
             soup = BS(html, "html.parser")
+
+            # ── Cerca link a pagina aziendale nella search page ───────────
+            # Pattern URL: /NNN/nome-azienda o /NNN/nome-azienda-in-liquidazione
+            import re as _re
+            company_link = None
+            for a in soup.select("a[href]"):
+                href = a.get("href", "")
+                # Pattern ufficiocamerale: /NUMERO/nome-slug
+                if _re.search(r"/\d+/[a-z]", href) and "ufficiocamerale" not in href:
+                    company_link = ("https://www.ufficiocamerale.it" + href
+                                    if href.startswith("/") else href)
+                    break
+                if "ufficiocamerale.it" in href and _re.search(r"/\d+/[a-z]", href):
+                    company_link = href
+                    break
+
+            if company_link:
+                # Controlla se l'URL contiene segnali di liquidazione
+                link_lower = company_link.lower()
+                liquidation_signals = [
+                    "in-liquidazione", "liquidazione", "scioglimento",
+                    "cancellata", "cessata"
+                ]
+                for signal in liquidation_signals:
+                    if signal in link_lower:
+                        log.warning(
+                            f"UfficioCamerale parse_html: LIQUIDAZIONE rilevata "
+                            f"nell'URL della pagina aziendale: {company_link}"
+                        )
+                        # Salva segnale in cache per LiquidationChecker
+                        liq_key = self.cache.make_key("liquidation_url_signal", vat_number)
+                        self.cache.set(liq_key, json.dumps({
+                            "signal":     f"{signal} (da pagina ricerca proxy)",
+                            "url":        company_link,
+                            "vat_number": vat_number,
+                        }))
+                        return {
+                            "vat_number":     vat_number,
+                            "page_url":       company_link,
+                            "company_status": "in liquidazione",
+                            "revenues":       None,
+                            "employees":      None,
+                            "source":         "ufficiocamerale_proxy_link",
+                        }
+
+            # ── Parsa la pagina corrente (potrebbe già essere la pagina aziendale) ──
             return self._extract_data(soup, page_url, vat_number)
+
         except Exception as e:
             log.warning(f"UfficioCamerale parse_html error: {e}")
             return None
