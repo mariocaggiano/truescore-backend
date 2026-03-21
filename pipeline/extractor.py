@@ -83,6 +83,7 @@ class ExtractionResult:
     claims: list[Claim]             = field(default_factory=list)
     financial_data: Optional[FinancialData] = None
     key_people: list[dict]          = field(default_factory=list)
+    tone_analysis: Optional[dict]   = None
     errors: list[str]               = field(default_factory=list)
     warnings: list[str]             = field(default_factory=list)
 
@@ -216,6 +217,49 @@ class LLMAdapter:
         resp = requests.post(url, json=payload, timeout=self.timeout)
         resp.raise_for_status()
         return resp.json()["message"]["content"]
+
+
+TONE_ANALYSIS_SYSTEM = """Sei un analista di comunicazione specializzato nella valutazione di materiali di marketing aziendale.
+Il tuo compito è analizzare il tono e il linguaggio di un pitch deck o one-pager aziendale.
+
+Cerca specificamente:
+
+1. LINGUAGGIO INFLAZIONATO — frasi che esagerano o non sono verificabili:
+   Esempi: "leader del mercato", "unici al mondo", "rivoluzionario", "disrupting", 
+   "game changer", "best-in-class", "world-class", "innovativo" senza contesto,
+   "traction", "ecosystem", "leverage", "synergy", "scalabile" senza dati
+
+2. NUMERI SENZA CONTESTO — cifre presentate senza benchmark o spiegazione:
+   Esempi: "crescita del 300%" (da cosa?), "10.000 clienti" (in quanto tempo?),
+   "mercato da 10 miliardi" (quota accessibile?), "NPS di 90" (campione?)
+
+3. VAGHEZZA STRATEGICA — affermazioni non falsificabili:
+   Esempi: "stiamo conquistando il mercato", "forte interesse da parte dei clienti",
+   "traction significativa", "pipeline molto solida", "team di esperti"
+
+4. CLAIM ASSOLUTE — superlative non supportate:
+   Esempi: "la migliore soluzione", "la più completa", "nessuno fa questo"
+
+Per ogni istanza trovata rispondi SOLO con questo JSON (array):
+[
+  {
+    "category": "inflated_language|number_without_context|strategic_vagueness|absolute_claim",
+    "phrase": "frase esatta trovata nel testo (max 80 caratteri)",
+    "explanation": "perché è un segnale di attenzione (max 120 caratteri)",
+    "severity": "high|medium|low",
+    "location": "dove appare nel documento (es. slide 2, sezione traction)"
+  }
+]
+
+REGOLE:
+- Sii preciso: estrai la frase ESATTA dal testo
+- Non inventare problemi inesistenti
+- Se il documento è sobrio e factual, restituisci []
+- Severity HIGH = affermazione chiaramente non verificabile o fuorviante
+- Severity MEDIUM = affermazione vaga ma comune nel settore
+- Severity LOW = linguaggio di marketing standard accettabile
+- Rispondi SOLO con JSON valido, nessun testo prima o dopo
+"""
 
 PEOPLE_EXTRACTION_SYSTEM = """Sei un analista di due diligence. Estrai dal testo le persone chiave dell'azienda.
 
@@ -604,7 +648,8 @@ class ClaimExtractor:
             except Exception:
                 pass
         if all_declarative_text.strip():
-            result.key_people = self._extract_people(all_declarative_text)
+            result.key_people   = self._extract_people(all_declarative_text)
+            result.tone_analysis = self._analyze_tone(all_declarative_text)
 
         # ── 4. Processa documenti probatori (bilancio) ────────────────────
         if probatory_sources:
@@ -701,6 +746,77 @@ class ClaimExtractor:
         except Exception as e:
             log.warning(f"LLM fallita su chunk [{source_location}]: {e}")
             return []
+
+    def _analyze_tone(self, text: str) -> dict:
+        """
+        Analizza il tono e il linguaggio del pitch deck con Mistral.
+        Rileva: linguaggio inflazionato, numeri senza contesto,
+        vaghezza strategica, claim assolute.
+        """
+        try:
+            user_prompt = (
+                "--- TESTO PITCH DECK ---\n"
+                + text[:5000]
+                + "\n--- FINE ---\n\nAnalizza il tono e il linguaggio."
+            )
+            response = self.llm.complete(TONE_ANALYSIS_SYSTEM, user_prompt)
+            flags = self._parse_json_response(response)
+            if not isinstance(flags, list):
+                flags = []
+
+            # Filtra e valida
+            valid_flags = []
+            for f in flags:
+                if not f.get("phrase") or not f.get("category"):
+                    continue
+                valid_flags.append({
+                    "category":    f.get("category", "other"),
+                    "phrase":      f.get("phrase", "")[:80],
+                    "explanation": f.get("explanation", "")[:120],
+                    "severity":    f.get("severity", "medium"),
+                    "location":    f.get("location", "")[:60],
+                })
+
+            # Calcola score tono 0-10 (10 = tono sobrio/credibile)
+            high   = sum(1 for f in valid_flags if f["severity"] == "high")
+            medium = sum(1 for f in valid_flags if f["severity"] == "medium")
+            low    = sum(1 for f in valid_flags if f["severity"] == "low")
+            penalty = high * 1.5 + medium * 0.8 + low * 0.3
+            tone_score = round(max(1.0, min(10.0, 10.0 - penalty)), 1)
+
+            # Label
+            if tone_score >= 8:   tone_label = "Tono sobrio e credibile"
+            elif tone_score >= 6: tone_label = "Qualche affermazione da verificare"
+            elif tone_score >= 4: tone_label = "Linguaggio spesso inflazionato"
+            else:                 tone_label = "Linguaggio altamente promozionale"
+
+            # Categorie trovate
+            cats = list({f["category"] for f in valid_flags})
+            cat_labels = {
+                "inflated_language":      "Linguaggio inflazionato",
+                "number_without_context": "Numeri senza contesto",
+                "strategic_vagueness":    "Vaghezza strategica",
+                "absolute_claim":         "Affermazioni assolute",
+            }
+
+            log.info(
+                f"ToneAnalysis: {len(valid_flags)} flag ({high} high, {medium} medium, {low} low) "                f"— Tone Score: {tone_score}"
+            )
+
+            return {
+                "flags":       valid_flags,
+                "total":       len(valid_flags),
+                "high_count":  high,
+                "med_count":   medium,
+                "low_count":   low,
+                "tone_score":  tone_score,
+                "tone_label":  tone_label,
+                "categories":  [cat_labels.get(c, c) for c in cats],
+            }
+
+        except Exception as e:
+            log.warning(f"Tone analysis error: {e}")
+            return {"flags": [], "total": 0, "tone_score": None, "tone_label": ""}
 
     def _extract_people(self, text: str) -> list[dict]:
         """Estrae persone chiave dal testo del pitch deck usando l'LLM."""
