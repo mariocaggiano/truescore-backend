@@ -266,6 +266,9 @@ async def run_pipeline(
             collection=collection,
             sector=sector or "default",
         )
+        # Inietta URL per enrichers supplementari
+        verification._website_url  = website_url or ""
+        verification._linkedin_url = linkedin_url or ""
 
         _emit(job_id, 3, "done",
               f"Trust Score: {verification.trust_score:.1f}/10")
@@ -314,6 +317,10 @@ async def run_pipeline(
             "legal_status": verification.legal_status,
             "key_people":   verification.key_people,
             "news_flags":   verification.news_flags,
+            "web_history":  verification.web_history,
+            "job_postings": verification.job_postings,
+            "email_domain": verification.email_domain,
+            "tech_stack":   verification.tech_stack,
             "pdf_ready":    True,
             "report_id":    config.report_id,
             "generated_at": config.generated_at,
