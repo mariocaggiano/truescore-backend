@@ -994,69 +994,206 @@ class UfficioCameraleConnector(BaseConnector):
     def _find_page_url(self, vat_number: str, company_name: str) -> Optional[str]:
         """
         Trova l'URL della pagina aziendale su ufficiocamerale.it.
-        URL reale: /{id_numerico}/{nome-slug} — trovato via form di ricerca.
+        URL reale: /{id_numerico}/{nome-slug}
 
-        Strategia:
-        1. POST al form /trova-azienda con la P.IVA
-        2. Ricerca Google come fallback
+        Strategia (in ordine di affidabilità):
+        1. Ricerca Google site:ufficiocamerale.it con P.IVA
+        2. Form di ricerca interno
+        3. Probe diretto: costruisce slug + tutti i suffissi di stato
+           e prova se la pagina risponde — deterministo, non dipende da Google
         """
-        # Tentativo 1: form di ricerca interno /trova-azienda
+        # ── Tentativo 1: Google site:ufficiocamerale.it + P.IVA ───────────
+        # (a volte funziona, a volte no — ma se funziona è il più veloce)
         try:
-            time.sleep(self.REQUEST_DELAY)
-            # Prima GET per ottenere eventuali token CSRF
-            base = "https://www.ufficiocamerale.it/trova-azienda"
-            r = self._get(base, timeout=8)
-            # Prova ricerca via GET con parametro
-            for param in ["piva", "partita_iva", "cf", "q", "search"]:
-                try:
-                    search_url = f"{base}?{param}={vat_number}"
-                    r2 = self._get(search_url, timeout=8)
-                    if r2.status_code == 200 and vat_number in r2.text:
-                        soup2 = BeautifulSoup(r2.text, "html.parser")
-                        for a in soup2.select("a[href]"):
-                            href = a.get("href", "")
-                            full = href if href.startswith("http") else "https://www.ufficiocamerale.it" + href
-                            if (re.search(r"/\d+/", full)
-                                    and "trova-azienda" not in full
-                                    and "news" not in full
-                                    and "cerca-pec" not in full):
-                                log.info(f"UfficioCamerale: trovata via search form: {full}")
-                                return full
-                except Exception:
-                    continue
-        except Exception as e:
-            log.debug(f"UfficioCamerale form: {e}")
-
-        # Tentativo 2: URL diretto con slug nome azienda derivato
-        try:
-            slug = company_name.lower()
-            for ch in [" s.r.l.", " srl", " s.p.a.", " spa", " s.n.c.", " snc"]:
-                slug = slug.replace(ch, "")
-            slug = re.sub(r"[^a-z0-9]+", "-", slug).strip("-")
-            # Il sito usa ID numerico + slug — proviamo con Google per trovarlo
             query = f'site:ufficiocamerale.it "{vat_number}"'
             url   = f"{self.GOOGLE_SEARCH}{quote_plus(query)}"
             resp  = self._get(url, timeout=8)
             soup  = BeautifulSoup(resp.text, "html.parser")
             for a in soup.select("a[href]"):
                 href = a.get("href", "")
-                if "ufficiocamerale.it/" in href:
-                    match = re.search(r"https?://www[.]ufficiocamerale[.]it/[0-9]+/[^ &'\"]+", href)
-                    if match:
-                        log.info(f"UfficioCamerale: trovata via Google: {match.group(0)}")
-                        return match.group(0)
-            # Prova anche con il nome azienda
-            query2 = f'site:ufficiocamerale.it "{slug}"'
-            resp2  = self._get(f"{self.GOOGLE_SEARCH}{quote_plus(query2)}", timeout=8)
-            soup2  = BeautifulSoup(resp2.text, "html.parser")
-            for a in soup2.select("a[href]"):
-                href = a.get("href", "")
-                if "ufficiocamerale.it/" in href:
-                    match = re.search(r"https?://www[.]ufficiocamerale[.]it/[0-9]+/[^ &'\"]+", href)
-                    if match:
-                        return match.group(0)
+                match = re.search(
+                    r"https?://(?:www\.)?ufficiocamerale\.it/[0-9]+/[^ &'\"]+", href
+                )
+                if match:
+                    found = match.group(0)
+                    log.info(f"UfficioCamerale: trovata via Google site:: {found}")
+                    return found
         except Exception as e:
-            log.debug(f"UfficioCamerale Google fallback: {e}")
+            log.debug(f"UfficioCamerale Google site: {e}")
+
+        # ── Tentativo 2: form di ricerca interno ──────────────────────────
+        try:
+            time.sleep(self.REQUEST_DELAY)
+            base = "https://www.ufficiocamerale.it/trova-azienda"
+            for param in ["piva", "partita_iva", "q"]:
+                try:
+                    r2 = self._get(f"{base}?{param}={vat_number}", timeout=8)
+                    if r2.status_code == 200 and vat_number in r2.text:
+                        soup2 = BeautifulSoup(r2.text, "html.parser")
+                        for a in soup2.select("a[href]"):
+                            href = a.get("href", "")
+                            full = (href if href.startswith("http")
+                                    else "https://www.ufficiocamerale.it" + href)
+                            if (re.search(r"/\d+/", full)
+                                    and "trova-azienda" not in full
+                                    and "news" not in full):
+                                log.info(f"UfficioCamerale: trovata via form: {full}")
+                                return full
+                except Exception:
+                    continue
+        except Exception as e:
+            log.debug(f"UfficioCamerale form: {e}")
+
+        # ── Tentativo 3: probe diretto con slug + tutti i suffissi di stato ─
+        # URL pattern: /ID/nome-srl  o  /ID/nome-srl-in-liquidazione
+        # Proviamo ID da 1 a ~9999 tramite una range ridotta
+        # NO — troppo lento. Usiamo slug search: Google a volte restituisce
+        # l'ID nei risultati anche senza site: — estraiamolo da lì.
+        # Poi con l'ID proviamo tutte le varianti di slug.
+        try:
+            slug_base = self._to_slug(company_name)
+            # Prima trova l'ID numerico cercando il solo nome su Google
+            google_id = self._find_uc_id(slug_base, vat_number)
+            if google_id:
+                return self._probe_slug_variants(google_id, slug_base, vat_number)
+        except Exception as e:
+            log.debug(f"UfficioCamerale slug probe: {e}")
+
+        return None
+
+    @staticmethod
+    def _to_slug(name: str) -> str:
+        """Converte nome azienda in slug URL stile ufficiocamerale."""
+        slug = name.lower()
+        # Rimuovi forma giuridica (viene spesso aggiunta allo slug)
+        for suffix in [" s.r.l.", " srl", " s.p.a.", " spa", " s.n.c.",
+                       " snc", " s.a.s.", " sas", " s.r.l"]:
+            slug = slug.replace(suffix, "")
+        # Normalizza caratteri speciali italiani
+        for old, new in [("à","a"),("è","e"),("é","e"),("ì","i"),("ò","o"),("ù","u")]:
+            slug = slug.replace(old, new)
+        slug = re.sub(r"[^a-z0-9]+", "-", slug).strip("-")
+        return slug
+
+    def _find_uc_id(self, slug: str, vat_number: str) -> Optional[str]:
+        """
+        Cerca l'ID numerico della pagina ufficiocamerale tramite Google.
+        Ritorna es. '4619' dall'URL /4619/revotree-srl-in-liquidazione.
+        """
+        # Query senza site: — a volte Google indicizza l'ID anche se non risponde a site:
+        queries = [
+            f'ufficiocamerale.it/{slug}',
+            f'ufficiocamerale.it {slug} {vat_number[-6:]}',  # ultimi 6 cifre P.IVA
+        ]
+        for query in queries:
+            try:
+                resp = self._get(
+                    f"{self.GOOGLE_SEARCH}{quote_plus(query)}", timeout=8
+                )
+                soup = BeautifulSoup(resp.text, "html.parser")
+                # Cerca qualsiasi link che contenga pattern /NUMERO/
+                for a in soup.select("a[href], cite"):
+                    text = a.get("href","") or a.get_text()
+                    match = re.search(r"ufficiocamerale\.it/(\d+)/", text)
+                    if match:
+                        return match.group(1)
+                time.sleep(0.5)
+            except Exception:
+                continue
+        return None
+
+    def _probe_slug_variants(
+        self, uc_id: str, slug_base: str, vat_number: str
+    ) -> Optional[str]:
+        """
+        Dato l'ID numerico, prova tutte le varianti di slug per trovare
+        la pagina reale dell'azienda — incluse tutte le varianti di stato.
+
+        Varianti coperte:
+          - attiva:         /ID/nome-srl
+          - in liquidazione: /ID/nome-srl-in-liquidazione
+          - fallita:        /ID/nome-srl-fallita
+          - sciolta:        /ID/nome-srl-sciolta
+          - cancellata:     /ID/nome-srl-cancellata
+          - cessata:        /ID/nome-srl-cessata
+          - e molte altre...
+        """
+        # Suffissi di stato ordinati per frequenza/importanza
+        # Prima le varianti "attiva" (nessun suffisso o -srl), poi gli stati negativi
+        status_suffixes = [
+            # Attiva — nessun suffisso extra o solo forma giuridica
+            "",
+            "-srl",
+            "-s-r-l",
+            "-spa",
+            # Liquidazione — la più comune per startup chiuse
+            "-in-liquidazione",
+            "-srl-in-liquidazione",
+            "-s-r-l-in-liquidazione",
+            "-spa-in-liquidazione",
+            "-in-liquidazione-volontaria",
+            "-in-liquidazione-giudiziale",
+            # Fallimento
+            "-fallita",
+            "-fallimento",
+            "-srl-fallita",
+            "-in-fallimento",
+            # Scioglimento
+            "-sciolta",
+            "-scioglimento",
+            "-in-scioglimento",
+            # Cancellazione
+            "-cancellata",
+            "-cancellata-dal-registro",
+            # Cessazione
+            "-cessata",
+            "-cessazione",
+            "-attivita-cessata",
+            # Concordato preventivo
+            "-concordato-preventivo",
+            "-in-concordato",
+        ]
+
+        base_url = f"https://www.ufficiocamerale.it/{uc_id}/{slug_base}"
+
+        for suffix in status_suffixes:
+            url = base_url + suffix
+            try:
+                time.sleep(0.3)  # delay contenuto — sono richieste sequenziali
+                resp = self._get(url, timeout=6)
+                if resp.status_code == 200 and len(resp.text) > 500:
+                    # Verifica che la pagina contenga la P.IVA (evita false positive)
+                    if vat_number[-8:] in resp.text or slug_base[:6] in resp.text.lower():
+                        log.info(
+                            f"UfficioCamerale: trovata via slug probe: {url}"
+                        )
+                        # Segnala liquidazione/stato negativo prima di restituire
+                        if any(s in url for s in [
+                            "liquidazione", "fallita", "fallimento",
+                            "sciolta", "cancellata", "cessata", "concordato"
+                        ]):
+                            liq_key = self.cache.make_key(
+                                "liquidation_url_signal", vat_number
+                            )
+                            status_word = next(
+                                (s for s in [
+                                    "in-liquidazione", "fallita", "fallimento",
+                                    "sciolta", "cancellata", "cessata", "concordato"
+                                ] if s in url),
+                                "stato-negativo"
+                            )
+                            self.cache.set(liq_key, json.dumps({
+                                "signal":     f"{status_word} (da slug probe diretto)",
+                                "url":        url,
+                                "vat_number": vat_number,
+                            }))
+                            log.warning(
+                                f"UfficioCamerale: stato NEGATIVO rilevato "
+                                f"({status_word}) per P.IVA {vat_number}: {url}"
+                            )
+                        return url
+            except Exception:
+                continue
 
         return None
 
