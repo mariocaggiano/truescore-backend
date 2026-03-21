@@ -82,6 +82,7 @@ class ExtractionResult:
     company_name: str
     claims: list[Claim]             = field(default_factory=list)
     financial_data: Optional[FinancialData] = None
+    key_people: list[dict]          = field(default_factory=list)
     errors: list[str]               = field(default_factory=list)
     warnings: list[str]             = field(default_factory=list)
 
@@ -215,6 +216,29 @@ class LLMAdapter:
         resp = requests.post(url, json=payload, timeout=self.timeout)
         resp.raise_for_status()
         return resp.json()["message"]["content"]
+
+PEOPLE_EXTRACTION_SYSTEM = """Sei un analista di due diligence. Estrai dal testo le persone chiave dell'azienda.
+
+Cerca: fondatori, CEO, CFO, COO, CTO, CMO, managing director, direttori, responsabili, partner, board members.
+
+Per ogni persona trovata rispondi SOLO con un array JSON:
+[
+  {
+    "name": "Nome Cognome",
+    "role": "Ruolo esatto come appare nel testo",
+    "role_category": "founder|ceo|cfo|coo|cto|cmo|director|other",
+    "context": "frase o contesto in cui appare la persona",
+    "confidence": 0.0-1.0
+  }
+]
+
+REGOLE:
+- Includi solo persone reali con nome e cognome (almeno 2 parole)
+- Escludi nomi generici ("il fondatore", "il team", "i nostri esperti")
+- Se non trovi persone, rispondi con []
+- Rispondi SOLO con JSON valido, nessun testo prima o dopo
+"""
+
 
 
 # ─────────────────────────────────────────────
@@ -557,6 +581,18 @@ class ClaimExtractor:
             except Exception as e:
                 result.warnings.append(f"Claim ignorata per errore di parsing: {e}")
 
+        # ── 3b. Estrai persone chiave dal testo dichiarativo ─────────────
+        # Usa tutto il testo concatenato dei documenti dichiarativi
+        all_declarative_text = ""
+        for source in declarative_sources:
+            try:
+                text, _ = self._ingest_source(source)
+                all_declarative_text += "\n\n" + text
+            except Exception:
+                pass
+        if all_declarative_text.strip():
+            result.key_people = self._extract_people(all_declarative_text)
+
         # ── 4. Processa documenti probatori (bilancio) ────────────────────
         if probatory_sources:
             for source in probatory_sources:
@@ -625,6 +661,39 @@ class ClaimExtractor:
 
         except Exception as e:
             log.warning(f"LLM fallita su chunk [{source_location}]: {e}")
+            return []
+
+    def _extract_people(self, text: str) -> list[dict]:
+        """Estrae persone chiave dal testo del pitch deck usando l'LLM."""
+        try:
+            user_prompt = (
+                "--- TESTO ---\n"
+                + text[:4000]
+                + "\n--- FINE ---\n\nEstrai tutte le persone chiave dell'azienda."
+            )
+            response = self.llm.complete(PEOPLE_EXTRACTION_SYSTEM, user_prompt)
+            people = self._parse_json_response(response)
+            if not isinstance(people, list):
+                return []
+            # Filtra: richiedi almeno nome + cognome
+            valid = []
+            for p in people:
+                name = p.get("name","").strip()
+                role = p.get("role","").strip()
+                if name and role and len(name.split()) >= 2:
+                    valid.append({
+                        "name":          name,
+                        "role":          role,
+                        "role_category": p.get("role_category","other"),
+                        "confidence":    float(p.get("confidence",0.7)),
+                        "source":        "pitch_deck_llm",
+                        "linkedin":      "",
+                        "url":           "",
+                    })
+            log.info(f"PeopleExtraction: {len(valid)} persone trovate nel pitch deck")
+            return valid
+        except Exception as e:
+            log.warning(f"Errore estrazione persone: {e}")
             return []
 
     def _extract_financial_data(self, text: str, doc_label: str) -> FinancialData | None:
