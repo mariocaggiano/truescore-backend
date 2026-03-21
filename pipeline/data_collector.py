@@ -713,20 +713,22 @@ class LinkedInConnector(BaseConnector):
             resp = self._get(profile_url)
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            headcount = self._extract_headcount(soup)
-            followers  = self._extract_followers(soup)
+            headcount   = self._extract_headcount(soup)
+            followers   = self._extract_followers(soup)
             description = self._extract_description(soup)
+            key_people  = self._extract_key_people(soup, profile_url)
 
-            if headcount is None:
+            if headcount is None and not key_people:
                 return None
 
             return {
-                "company_name": company_name,
-                "profile_url": profile_url,
-                "headcount_range": headcount,
-                "headcount_midpoint": self._range_midpoint(headcount),
-                "followers": followers,
+                "company_name":      company_name,
+                "profile_url":       profile_url,
+                "headcount_range":   headcount,
+                "headcount_midpoint": self._range_midpoint(headcount) if headcount else None,
+                "followers":         followers,
                 "description_snippet": description[:200] if description else "",
+                "key_people":        key_people,
             }
 
         except Exception as e:
@@ -784,6 +786,71 @@ class LinkedInConnector(BaseConnector):
             if el:
                 return el.get("content", "") or el.get_text(strip=True)
         return ""
+
+    @staticmethod
+    def _extract_key_people(soup: BeautifulSoup, profile_url: str) -> list[dict]:
+        """
+        Estrae persone chiave dalla pagina LinkedIn aziendale pubblica.
+        LinkedIn mostra highlight di dipendenti e dirigenti nel HTML pubblico.
+        Strategia: cerca pattern "Nome Cognome\nRuolo" nel testo della pagina.
+        """
+        people = []
+        text   = soup.get_text("\n", strip=True)
+        lines  = [l.strip() for l in text.split("\n") if l.strip()]
+
+        # Ruoli C-suite da cercare
+        c_suite_keywords = [
+            "ceo", "chief executive", "founder", "co-founder", "fondatore",
+            "cfo", "chief financial", "coo", "chief operating",
+            "cto", "chief technology", "cmo", "chief marketing",
+            "presidente", "managing director", "direttore generale",
+            "vp ", "vice president", "head of", "director", "direttore",
+            "partner", "principal",
+        ]
+
+        seen_names = set()
+
+        for i, line in enumerate(lines):
+            line_lower = line.lower()
+            # Il ruolo deve contenere una parola chiave
+            if not any(kw in line_lower for kw in c_suite_keywords):
+                continue
+            # Il ruolo non deve essere troppo lungo (>80 char = probabilmente non un titolo)
+            if len(line) > 80 or len(line) < 3:
+                continue
+
+            # Cerca il nome nelle righe precedenti (LinkedIn: nome sopra, ruolo sotto)
+            for offset in [-1, -2, 1]:
+                idx = i + offset
+                if 0 <= idx < len(lines):
+                    candidate = lines[idx].strip()
+                    parts = candidate.split()
+                    # Nome valido: 2-4 parole, iniziali maiuscole, non un'URL o numero
+                    if (2 <= len(parts) <= 4
+                            and all(p[0].isupper() for p in parts if p)
+                            and not any(c in candidate for c in ["@", "http", "/", "•", "|"])
+                            and candidate not in seen_names):
+                        seen_names.add(candidate)
+                        people.append({
+                            "name":       candidate,
+                            "role":       line.strip(),
+                            "source":     "linkedin_company_page",
+                            "url":        profile_url,
+                            "linkedin":   "",
+                            "confidence": 0.72,
+                        })
+                        break
+
+        # Dedup aggressivo: tieni solo il primo per nome cognome
+        seen = set()
+        deduped = []
+        for p in people:
+            key = p["name"].lower()
+            if key not in seen:
+                seen.add(key)
+                deduped.append(p)
+
+        return deduped[:10]  # max 10
 
     @staticmethod
     def _range_midpoint(headcount_str: str) -> Optional[int]:
@@ -1398,9 +1465,18 @@ class PeopleFinderConnector(BaseConnector):
     ]
 
     def fetch(self, claim: dict, company_name: str) -> ConnectorResult:
-        claim_id = claim.get("id", "")
-        claim_type = claim.get("type", "")
+        """
+        Trova persone chiave combinando più sorgenti.
+        Priorità:
+        1. LinkedIn company page (già scaricata dal LinkedInConnector — dati certi)
+        2. Pagina /team del sito aziendale
+        3. Google search via proxy (se disponibile)
+        """
+        claim_id    = claim.get("id", "")
+        claim_type  = claim.get("type", "")
         website_url = claim.get("website_url", "").strip().rstrip("/")
+        linkedin_url = claim.get("linkedin_url", "").strip()
+        proxy_base  = claim.get("proxy_base_url", "")  # URL del backend per proxy
 
         cache_key = self.cache.make_key(self.NAME, company_name)
         cached = self.cache.get(cache_key)
@@ -1416,22 +1492,18 @@ class PeopleFinderConnector(BaseConnector):
         people  = []
         sources = []
 
-        # ── Sorgente 1: Google ricerca diretta ───────────────────────────
-        google_people = self._search_google_people(company_name)
-        people.extend(google_people)
-        if google_people:
-            sources.append("google_search")
+        # ── Sorgente 1: LinkedIn company page (già in cache da LinkedInConnector) ──
+        li_cached_key = self.cache.make_key("linkedin", company_name)
+        li_cached = self.cache.get(li_cached_key)
+        if li_cached:
+            li_data = json.loads(li_cached)
+            li_kp   = li_data.get("key_people", [])
+            if li_kp:
+                people.extend(li_kp)
+                sources.append("linkedin_company_page")
+                log.info(f"PeopleFinder: {len(li_kp)} persone da LinkedIn cache")
 
-        # ── Sorgente 2: LinkedIn profiles via Google ──────────────────────
-        li_people = self._search_linkedin_profiles(company_name)
-        # Aggiungi solo se non duplica
-        for p in li_people:
-            if not any(self._same_person(p, existing) for existing in people):
-                people.append(p)
-        if li_people:
-            sources.append("linkedin_google")
-
-        # ── Sorgente 3: pagina /team o /about del sito ────────────────────
+        # ── Sorgente 2: pagina /team o /about del sito ────────────────────────────
         if website_url:
             site_people = self._scrape_team_page(website_url)
             for p in site_people:
@@ -1440,8 +1512,25 @@ class PeopleFinderConnector(BaseConnector):
             if site_people:
                 sources.append("website_team_page")
 
-        # Ordina per rilevanza: C-suite prima
-        people = self._rank_people(people)[:15]  # max 15
+        # ── Sorgente 3: Google via proxy (se proxy disponibile) ──────────────────
+        if proxy_base and len(people) < 5:
+            google_people = self._search_google_via_proxy(company_name, proxy_base)
+            for p in google_people:
+                if not any(self._same_person(p, existing) for existing in people):
+                    people.append(p)
+            if google_people:
+                sources.append("google_proxy")
+
+        # ── Sorgente 4: LinkedIn diretto se URL fornito e ancora poche persone ───
+        if linkedin_url and len(people) < 3:
+            li_direct = self._scrape_linkedin_direct(linkedin_url, company_name)
+            for p in li_direct:
+                if not any(self._same_person(p, existing) for existing in people):
+                    people.append(p)
+            if li_direct:
+                sources.append("linkedin_direct")
+
+        people = self._rank_people(people)[:15]
 
         data = {
             "people":  people,
@@ -1464,6 +1553,43 @@ class PeopleFinderConnector(BaseConnector):
             found=False,
             notes=f"Nessuna persona chiave trovata per '{company_name}'"
         )
+
+    def _search_google_via_proxy(self, company_name: str, proxy_base: str) -> list[dict]:
+        """Cerca persone su Google passando per il proxy del backend."""
+        people = []
+        queries = [
+            f'"{company_name}" CEO OR fondatore OR founder',
+            f'site:linkedin.com/in "{company_name}"',
+        ]
+        for query in queries[:2]:
+            try:
+                google_url = f"https://www.google.com/search?q={quote_plus(query)}&num=10"
+                proxy_url  = f"{proxy_base}/api/proxy-fetch?url={quote_plus(google_url)}"
+                resp = self._get(proxy_url, timeout=10)
+                if resp.status_code != 200:
+                    continue
+                result = resp.json()
+                if result.get("status") != 200:
+                    continue
+                soup = BeautifulSoup(result.get("html",""), "html.parser")
+                people.extend(self._extract_people_from_soup(soup, company_name))
+            except Exception as e:
+                log.debug(f"PeopleFinder proxy search: {e}")
+        return people
+
+    def _scrape_linkedin_direct(self, linkedin_url: str, company_name: str) -> list[dict]:
+        """Scrapa la pagina LinkedIn direttamente per estrarre persone."""
+        try:
+            time.sleep(self.REQUEST_DELAY)
+            resp = self._get(linkedin_url.split("?")[0].rstrip("/"), timeout=10)
+            if resp.status_code != 200:
+                return []
+            soup = BeautifulSoup(resp.text, "html.parser")
+            from data_collector import LinkedInConnector
+            return LinkedInConnector._extract_key_people(soup, linkedin_url)
+        except Exception as e:
+            log.debug(f"PeopleFinder LinkedIn direct: {e}")
+        return []
 
     def _search_google_people(self, company_name: str) -> list[dict]:
         """Cerca persone chiave via Google snippet."""
@@ -1872,12 +1998,14 @@ class DataCollector:
         vat_number: str = "",
         uc_prefetched: Optional[dict] = None,   # dati UfficioCamerale pre-parsati dal browser
         oc_prefetched: Optional[dict] = None,   # dati OpenCorporates pre-parsati dal browser
+        proxy_base_url: str = "",               # URL del backend per proxy fetch
     ):
         shared_cache = cache or InMemoryCache()
-        self.linkedin_url  = linkedin_url.strip()
-        self.vat_number    = vat_number.strip()
-        self.uc_prefetched = uc_prefetched
-        self.oc_prefetched = oc_prefetched
+        self.linkedin_url    = linkedin_url.strip()
+        self.vat_number      = vat_number.strip()
+        self.uc_prefetched   = uc_prefetched
+        self.oc_prefetched   = oc_prefetched
+        self.proxy_base_url  = proxy_base_url.strip()
 
         # Pre-popola la cache con i dati già ottenuti dal browser
         if uc_prefetched:
@@ -1920,6 +2048,8 @@ class DataCollector:
             "normalized_value": None,
             "website_url":      website_url,
             "vat_number":       self.vat_number,
+            "linkedin_url":     self.linkedin_url,
+            "proxy_base_url":   getattr(self, "proxy_base_url", ""),
         }
         for name in ["opencorporates", "ufficiocamerale", "people_finder"]:
             if name == "ufficiocamerale" and not self.vat_number:
@@ -1952,6 +2082,8 @@ class DataCollector:
                 claim_dict = {**claim_dict, "linkedin_url": self.linkedin_url}
             if self.vat_number:
                 claim_dict = {**claim_dict, "vat_number": self.vat_number}
+            if self.proxy_base_url:
+                claim_dict = {**claim_dict, "proxy_base_url": self.proxy_base_url}
 
             claim_type = claim_dict.get("type", "other")
             connector_names = list(self.CLAIM_CONNECTOR_MAP.get(claim_type, []))
