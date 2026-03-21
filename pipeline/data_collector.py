@@ -2255,34 +2255,75 @@ class LiquidationChecker(BaseConnector):
         )
 
     def _check_google(self, company_name: str, proxy_base: str) -> list[str]:
-        """Cerca segnali di liquidazione via Google tramite proxy."""
+        """
+        Cerca segnali di liquidazione tramite proxy.
+        Usa più query progressive e anche ATOKA come fonte secondaria.
+        """
         signals = []
-        query = f'"{company_name}" "in liquidazione" OR scioglimento OR "cancellata" OR "cessata"'
-        try:
-            google_url = f"{self.GOOGLE_BASE}{quote_plus(query)}&num=10"
-            proxy_url  = f"{proxy_base}/api/proxy-fetch?url={quote_plus(google_url)}"
-            resp       = self._get(proxy_url, timeout=10)
-            if resp.status_code != 200:
-                return signals
-            result = resp.json()
-            if result.get("status") != 200:
-                return signals
+        if not proxy_base:
+            return signals
 
-            soup = BeautifulSoup(result.get("html", ""), "html.parser")
-            text = soup.get_text(" ", strip=True).lower()
+        # Query progressive — dalla più specifica alla più permissiva
+        queries = [
+            f'{company_name} "in liquidazione"',
+            f'{company_name} liquidazione srl',
+            f'{company_name} "sciolta" OR "cancellata dal registro imprese"',
+        ]
 
-            for signal in self.DEFINITIVE_SIGNALS + self.WARNING_SIGNALS:
-                if signal in text:
-                    # Trova il contesto
-                    idx = text.find(signal)
-                    context = text[max(0,idx-30):idx+60].strip()
-                    signals.append(f'"{signal}" trovato: ...{context}...')
-                    break  # basta il primo per la cache
+        for query in queries:
+            try:
+                google_url = f"{self.GOOGLE_BASE}{quote_plus(query)}&num=10"
+                proxy_url  = f"{proxy_base}/api/proxy-fetch?url={quote_plus(google_url)}"
+                resp       = self._get(proxy_url, timeout=10)
+                if resp.status_code != 200:
+                    continue
+                result = resp.json()
+                if result.get("status") != 200:
+                    continue
 
-        except Exception as e:
-            log.debug(f"LiquidationChecker Google error: {e}")
+                soup = BeautifulSoup(result.get("html", ""), "html.parser")
+                text = soup.get_text(" ", strip=True).lower()
+
+                for signal in self.DEFINITIVE_SIGNALS:
+                    if signal in text:
+                        idx     = text.find(signal)
+                        context = text[max(0, idx-40):idx+80].strip()
+                        signals.append(f'Google: "{signal}" — ...{context[:80]}...')
+                        break
+
+                if signals:
+                    break
+                time.sleep(self.REQUEST_DELAY)
+
+            except Exception as e:
+                log.debug(f"LiquidationChecker Google ({query[:40]}): {e}")
+
+        # Fallback: ATOKA (database imprese pubblico — mostra stato inattivo)
+        if not signals:
+            try:
+                atoka_url = (
+                    "https://atoka.io/aziende/?"
+                    f"name={quote_plus(company_name)}&active=false"
+                )
+                proxy_url = f"{proxy_base}/api/proxy-fetch?url={quote_plus(atoka_url)}"
+                resp      = self._get(proxy_url, timeout=10)
+                if resp.status_code == 200:
+                    result = resp.json()
+                    if result.get("status") == 200:
+                        soup = BeautifulSoup(result.get("html", ""), "html.parser")
+                        text = soup.get_text(" ", strip=True).lower()
+                        if company_name.lower()[:6] in text:
+                            for signal in self.DEFINITIVE_SIGNALS:
+                                if signal in text:
+                                    signals.append(
+                                        f'ATOKA: "{signal}" per {company_name}'
+                                    )
+                                    break
+            except Exception as e:
+                log.debug(f"LiquidationChecker ATOKA: {e}")
 
         return signals
+
 
 
 # ─────────────────────────────────────────────
