@@ -210,6 +210,9 @@ async def run_pipeline(
             except Exception as e:
                 log.warning(f"[{job_id[:8]}] OpenCorporates parse error: {e}")
 
+        # Determina URL base per proxy (usato da PeopleFinder per Google search)
+        request_host = "https://truescore-backend.onrender.com"  # default production
+
         collector = DataCollector(
             financial_data=fin.__dict__ if fin else None,
             crunchbase_api_key=crunchbase_api_key or "",
@@ -218,6 +221,7 @@ async def run_pipeline(
             vat_number=vat_number,
             uc_prefetched=uc_prefetched_data,
             oc_prefetched=oc_prefetched_data,
+            proxy_base_url=request_host,
         )
 
         collection = collector.collect(
