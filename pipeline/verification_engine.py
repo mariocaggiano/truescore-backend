@@ -104,6 +104,7 @@ class VerificationResult:
     unverifiable: list[ClaimVerdict] = field(default_factory=list)
     errors: list[str]                = field(default_factory=list)
     legal_status: Optional[dict]     = None   # dati OpenCorporates
+    key_people: Optional[dict]       = None   # persone chiave da PeopleFinder
 
     def summary(self) -> str:
         lines = [
@@ -133,6 +134,7 @@ class VerificationResult:
             "warnings": [v.claim_id for v in self.warnings_list],
             "unverifiable": [v.claim_id for v in self.unverifiable],
             "legal_status": self.legal_status,
+            "key_people":   self.key_people,
             "errors": self.errors,
         }
 
@@ -937,6 +939,74 @@ class LegalStatusVerifier:
         }.get(status, status.title())
 
 
+class PeopleEnricher:
+    """
+    Popola result.key_people dai dati PeopleFinder.
+    Genera anche un testo di relazione sintetica sulle persone chiave.
+    """
+
+    @staticmethod
+    def enrich(result: "VerificationResult", raw_results: list[dict]) -> None:
+        pf_results = [
+            r for r in raw_results
+            if r.get("connector") == "people_finder" and r.get("found")
+        ]
+
+        if not pf_results:
+            result.key_people = {"found": False, "people": [], "summary": ""}
+            return
+
+        data   = pf_results[0].get("data", {})
+        people = data.get("people", [])
+
+        if not people:
+            result.key_people = {"found": False, "people": [], "summary": ""}
+            return
+
+        # Genera relazione sintetica
+        summary = PeopleEnricher._build_summary(people, result.company_name)
+
+        result.key_people = {
+            "found":   True,
+            "people":  people,
+            "count":   len(people),
+            "sources": data.get("sources", []),
+            "summary": summary,
+        }
+
+    @staticmethod
+    def _build_summary(people: list[dict], company_name: str) -> str:
+        if not people:
+            return ""
+
+        lines = []
+        c_suite = [p for p in people if any(
+            r in p.get("role","").lower()
+            for r in ["ceo","founder","fondatore","presidente","managing","cfo","coo","cto"]
+        )]
+        others = [p for p in people if p not in c_suite]
+
+        if c_suite:
+            refs = []
+            for p in c_suite[:4]:
+                entry = f"{p['name']} ({p['role']})"
+                if p.get("linkedin"):
+                    entry += " [LinkedIn]"
+                refs.append(entry)
+            lines.append(f"Leadership identificata: {'; '.join(refs)}.")
+
+        if others:
+            other_names = [f"{p['name']} ({p['role']})" for p in others[:3]]
+            lines.append(f"Altri responsabili: {'; '.join(other_names)}.")
+
+        lines.append(
+            f"Fonti: ricerca Google e LinkedIn pubblico. "
+            f"Per contatti diretti verificare i profili LinkedIn indicati."
+        )
+
+        return " ".join(lines)
+
+
 class OtherVerifier(BaseVerifier):
     """Catch-all per tipi di claim non gestiti."""
 
@@ -1047,6 +1117,9 @@ class VerificationEngine:
 
         # ── Arricchisci con dati legali OpenCorporates ───────────────────
         LegalStatusVerifier.enrich(result, raw_results)
+
+        # ── Arricchisci con persone chiave ────────────────────────────────
+        PeopleEnricher.enrich(result, raw_results)
 
         # ── Calcola Trust Score ───────────────────────────────────────────
         result.trust_score = self._compute_trust_score(result.verdicts)
