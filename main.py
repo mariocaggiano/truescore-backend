@@ -286,6 +286,7 @@ async def run_pipeline(
             "warnings":     [v.claim_id for v in verification.warnings_list],
             "unverifiable": [v.claim_id for v in verification.unverifiable],
             "legal_status": verification.legal_status,
+            "key_people":   verification.key_people,
             "pdf_ready":    True,
             "report_id":    config.report_id,
             "generated_at": config.generated_at,
