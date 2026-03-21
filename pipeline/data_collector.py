@@ -2256,14 +2256,22 @@ class LiquidationChecker(BaseConnector):
 
     def _check_google(self, company_name: str, proxy_base: str) -> list[str]:
         """
-        Cerca segnali di liquidazione tramite proxy.
-        Usa più query progressive e anche ATOKA come fonte secondaria.
+        Cerca segnali di liquidazione con richieste HTTP DIRETTE a Google.
+        Non usa il proxy endpoint (evita deadlock su server single-threaded).
+        Replica la logica proxy internamente: passa X-Forwarded-For per bypassare
+        i blocchi IP dei datacenter.
         """
         signals = []
-        if not proxy_base:
-            return signals
 
-        # Query progressive — dalla più specifica alla più permissiva
+        headers = {
+            "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/122.0.0.0 Safari/537.36",
+            "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
+            "Referer":         "https://www.google.it/",
+        }
+
         queries = [
             f'{company_name} "in liquidazione"',
             f'{company_name} liquidazione srl',
@@ -2272,23 +2280,26 @@ class LiquidationChecker(BaseConnector):
 
         for query in queries:
             try:
-                google_url = f"{self.GOOGLE_BASE}{quote_plus(query)}&num=10"
-                proxy_url  = f"{proxy_base}/api/proxy-fetch?url={quote_plus(google_url)}"
-                resp       = self._get(proxy_url, timeout=10)
+                url  = f"https://www.google.com/search?q={quote_plus(query)}&num=10&hl=it"
+                resp = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
                 if resp.status_code != 200:
-                    continue
-                result = resp.json()
-                if result.get("status") != 200:
+                    time.sleep(self.REQUEST_DELAY)
                     continue
 
-                soup = BeautifulSoup(result.get("html", ""), "html.parser")
+                soup = BeautifulSoup(resp.text, "html.parser")
                 text = soup.get_text(" ", strip=True).lower()
 
                 for signal in self.DEFINITIVE_SIGNALS:
                     if signal in text:
                         idx     = text.find(signal)
                         context = text[max(0, idx-40):idx+80].strip()
-                        signals.append(f'Google: "{signal}" — ...{context[:80]}...')
+                        signals.append(
+                            f'Google: "{signal}" — ...{context[:80]}...'
+                        )
+                        log.info(
+                            f"LiquidationChecker: trovato '{signal}' "
+                            f"per '{company_name}' su Google"
+                        )
                         break
 
                 if signals:
@@ -2298,31 +2309,31 @@ class LiquidationChecker(BaseConnector):
             except Exception as e:
                 log.debug(f"LiquidationChecker Google ({query[:40]}): {e}")
 
-        # Fallback: ATOKA (database imprese pubblico — mostra stato inattivo)
+        # Fallback: ATOKA (database imprese pubblico italiano)
         if not signals:
             try:
-                atoka_url = (
-                    "https://atoka.io/aziende/?"
-                    f"name={quote_plus(company_name)}&active=false"
-                )
-                proxy_url = f"{proxy_base}/api/proxy-fetch?url={quote_plus(atoka_url)}"
-                resp      = self._get(proxy_url, timeout=10)
+                url  = (f"https://atoka.io/aziende/?"
+                        f"name={quote_plus(company_name)}&active=false")
+                resp = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
                 if resp.status_code == 200:
-                    result = resp.json()
-                    if result.get("status") == 200:
-                        soup = BeautifulSoup(result.get("html", ""), "html.parser")
-                        text = soup.get_text(" ", strip=True).lower()
-                        if company_name.lower()[:6] in text:
-                            for signal in self.DEFINITIVE_SIGNALS:
-                                if signal in text:
-                                    signals.append(
-                                        f'ATOKA: "{signal}" per {company_name}'
-                                    )
-                                    break
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    text = soup.get_text(" ", strip=True).lower()
+                    if company_name.lower()[:5] in text:
+                        for signal in self.DEFINITIVE_SIGNALS:
+                            if signal in text:
+                                signals.append(
+                                    f'ATOKA: "{signal}" per {company_name}'
+                                )
+                                log.info(
+                                    f"LiquidationChecker: trovato '{signal}' "
+                                    f"per '{company_name}' su ATOKA"
+                                )
+                                break
             except Exception as e:
                 log.debug(f"LiquidationChecker ATOKA: {e}")
 
         return signals
+
 
 
 
