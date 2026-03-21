@@ -105,6 +105,7 @@ class VerificationResult:
     errors: list[str]                = field(default_factory=list)
     legal_status: Optional[dict]     = None   # dati OpenCorporates
     key_people: Optional[dict]       = None   # persone chiave da PeopleFinder
+    news_flags: Optional[dict]        = None   # red flags da NewsAPI
 
     def summary(self) -> str:
         lines = [
@@ -135,6 +136,7 @@ class VerificationResult:
             "unverifiable": [v.claim_id for v in self.unverifiable],
             "legal_status": self.legal_status,
             "key_people":   self.key_people,
+            "news_flags":   self.news_flags,
             "errors": self.errors,
         }
 
@@ -1007,6 +1009,98 @@ class PeopleEnricher:
         return " ".join(lines)
 
 
+class NewsEnricher:
+    """
+    Popola result.news_flags dagli articoli trovati da NewsConnector.
+    Genera anche un impatto sul Trust Score se ci sono articoli ad alta gravità.
+    """
+
+    CATEGORY_LABELS = {
+        "legal":         "Controversie legali",
+        "financial":     "Segnali finanziari negativi",
+        "reputational":  "Reputazione",
+        "regulatory":    "Violazioni normative",
+    }
+
+    SEVERITY_LABELS = {
+        "high":    "Alta gravità",
+        "medium":  "Media gravità",
+        "low":     "Bassa gravità",
+    }
+
+    @staticmethod
+    def enrich(result: "VerificationResult", raw_results: list[dict]) -> None:
+        news_results = [
+            r for r in raw_results
+            if r.get("connector") == "news"
+        ]
+
+        if not news_results:
+            result.news_flags = {"found": False, "articles": [], "summary": "",
+                                 "high_count": 0, "total": 0}
+            return
+
+        data     = news_results[0].get("data", {})
+        articles = data.get("articles", [])
+
+        if not articles:
+            result.news_flags = {"found": False, "articles": [], "summary": "",
+                                 "high_count": 0, "total": 0,
+                                 "searched": True}
+            return
+
+        high   = [a for a in articles if a.get("severity") == "high"]
+        medium = [a for a in articles if a.get("severity") == "medium"]
+        cats   = data.get("categories_found", [])
+
+        # Genera summary
+        summary = NewsEnricher._build_summary(articles, high, medium, cats, result.company_name)
+
+        # Se ci sono articoli ad alta gravità, aggiungi ai red_flags del report
+        for a in high[:3]:
+            result.red_flags.append(
+                type("NewsFlag", (), {
+                    "claim_id":   f"NEWS_{a.get('category','').upper()}",
+                    "claim_type": "news_flag",
+                    "verdict":    type("V", (), {"value": "discrepancy"})(),
+                    "claim_text": f"[NEWS] {a.get('title','')[:100]}",
+                })()
+            )
+
+        result.news_flags = {
+            "found":      True,
+            "articles":   articles,
+            "high_count": len(high),
+            "med_count":  len(medium),
+            "total":      len(articles),
+            "categories": cats,
+            "summary":    summary,
+            "source":     "newsapi",
+        }
+
+    @staticmethod
+    def _build_summary(articles, high, medium, cats, company_name):
+        if not articles:
+            return ""
+        parts = []
+        if high:
+            parts.append(
+                f"{len(high)} articolo/i ad alta gravità: "
+                + "; ".join(a["title"][:60] for a in high[:2])
+                + ("..." if len(high) > 2 else ".")
+            )
+        if medium:
+            parts.append(f"{len(medium)} segnalazione/i di media gravità.")
+        if cats:
+            cat_labels = [NewsEnricher.CATEGORY_LABELS.get(c, c) for c in cats]
+            parts.append(f"Aree coinvolte: {', '.join(cat_labels)}.")
+        parts.append(
+            "Verificare gli articoli originali prima di trarre conclusioni. "
+            "La ricerca copre fonti italiane indicizzate da NewsAPI."
+        )
+        return " ".join(parts)
+
+
 class OtherVerifier(BaseVerifier):
     """Catch-all per tipi di claim non gestiti."""
 
@@ -1120,6 +1214,9 @@ class VerificationEngine:
 
         # ── Arricchisci con persone chiave ────────────────────────────────
         PeopleEnricher.enrich(result, raw_results)
+
+        # ── Arricchisci con news red flags ────────────────────────────────
+        NewsEnricher.enrich(result, raw_results)
 
         # ── Calcola Trust Score ───────────────────────────────────────────
         result.trust_score = self._compute_trust_score(result.verdicts)
