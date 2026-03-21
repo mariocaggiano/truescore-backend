@@ -526,8 +526,10 @@ async def proxy_fetch(
     allowed_domains = [
         "ufficiocamerale.it",
         "opencorporates.com",
-        "www.google.com",       # per ricerche LinkedIn profile via PeopleFinder
+        "www.google.com",
         "google.com",
+        "atoka.io",             # database imprese italiane - stato societario
+        "www.atoka.io",
     ]
     if not any(d in url for d in allowed_domains):
         raise HTTPException(400, "Dominio non autorizzato")
