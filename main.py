@@ -223,6 +223,7 @@ async def run_pipeline(
             oc_prefetched=oc_prefetched_data,
             proxy_base_url=request_host,
             pitch_key_people=extraction.key_people,
+            news_api_key=os.getenv("NEWS_API_KEY", ""),
         )
 
         collection = collector.collect(
@@ -292,6 +293,7 @@ async def run_pipeline(
             "unverifiable": [v.claim_id for v in verification.unverifiable],
             "legal_status": verification.legal_status,
             "key_people":   verification.key_people,
+            "news_flags":   verification.news_flags,
             "pdf_ready":    True,
             "report_id":    config.report_id,
             "generated_at": config.generated_at,
