@@ -884,14 +884,51 @@ class UfficioCameraleConnector(BaseConnector):
             log.warning(f"UfficioCamerale: pagina non trovata per P.IVA {vat_number}")
             return None
 
+        # ── Rileva liquidazione direttamente dall'URL slug ─────────────────
+        # L'URL ufficiocamerale include "in-liquidazione" nello slug se l'azienda
+        # è in liquidazione — es: /4619/revotree-srl-in-liquidazione
+        url_lower = page_url.lower()
+        is_liquidation = any(s in url_lower for s in [
+            "in-liquidazione", "liquidazione", "in-scioglimento",
+            "scioglimento", "cancellata", "cessata"
+        ])
+        if is_liquidation:
+            log.warning(
+                f"UfficioCamerale: LIQUIDAZIONE rilevata dall'URL slug per "
+                f"'{company_name}': {page_url}"
+            )
+            # Salva in cache liquidazione con chiave speciale accessibile da LiquidationChecker
+            liq_key = self.cache.make_key("liquidation_url_signal", vat_number)
+            self.cache.set(liq_key, json.dumps({
+                "signal":     "in-liquidazione (da URL ufficiocamerale)",
+                "url":        page_url,
+                "vat_number": vat_number,
+                "company":    company_name,
+            }))
+
         try:
             time.sleep(self.REQUEST_DELAY)
             resp = self._get(page_url)
             soup = BeautifulSoup(resp.text, "html.parser")
-            return self._extract_data(soup, page_url, vat_number)
+            data = self._extract_data(soup, page_url, vat_number)
+            # Se non ha estratto company_status ma l'URL dice liquidazione
+            if data and is_liquidation:
+                data["company_status"] = data.get("company_status") or "in liquidazione"
+            return data
         except Exception as e:
             log.warning(f"UfficioCamerale scraping error: {e}")
+            # Anche se lo scraping fallisce, restituiamo dati minimi se sappiamo lo status
+            if is_liquidation:
+                return {
+                    "vat_number":     vat_number,
+                    "page_url":       page_url,
+                    "company_status": "in liquidazione",
+                    "revenues":       None,
+                    "employees":      None,
+                    "source":         "ufficiocamerale_url_slug",
+                }
             return None
+
 
     def parse_html(self, html: str, page_url: str, vat_number: str) -> Optional[dict]:
         """
@@ -2134,13 +2171,17 @@ class LiquidationChecker(BaseConnector):
     # Frasi che indicano liquidazione con certezza
     DEFINITIVE_SIGNALS = [
         "in liquidazione",
+        "in-liquidazione",          # variante URL slug
         "messa in liquidazione",
         "sciolta e messa in liquidazione",
         "cancellata dal registro",
+        "cessazione attivita",
         "cessazione attività",
         "liquidazione volontaria",
         "liquidazione giudiziale",
         "procedura di liquidazione",
+        "srl in liquidazione",
+        "s.r.l. in liquidazione",
     ]
 
     # Frasi che suggeriscono problemi ma non certezza
@@ -2204,8 +2245,24 @@ class LiquidationChecker(BaseConnector):
             except Exception:
                 pass
 
-        # ── 3. Controlla cache UfficioCamerale ────────────────────────────
-        uc_key  = self.cache.make_key("ufficiocamerale", claim.get("vat_number",""))
+        # ── 3. Controlla cache UfficioCamerale (stato + segnale URL slug) ──────
+        vat = claim.get("vat_number","")
+
+        # Segnale da URL slug (scritto da UfficioCamerale._scrape_company_data)
+        liq_url_key = self.cache.make_key("liquidation_url_signal", vat)
+        liq_url_data = self.cache.get(liq_url_key)
+        if liq_url_data:
+            try:
+                liq = json.loads(liq_url_data)
+                result_data["signals"].append(
+                    f"UfficioCamerale URL: {liq.get('signal','in-liquidazione')} — {liq.get('url','')[:80]}"
+                )
+                result_data["sources"].append("ufficiocamerale")
+            except Exception:
+                pass
+
+        # Stato esplicito nei dati UfficioCamerale
+        uc_key  = self.cache.make_key("ufficiocamerale", vat)
         uc_data = self.cache.get(uc_key)
         if uc_data:
             try:
@@ -2215,7 +2272,8 @@ class LiquidationChecker(BaseConnector):
                     result_data["signals"].append(
                         f"Stato UfficioCamerale: {uc.get('company_status','')}"
                     )
-                    result_data["sources"].append("ufficiocamerale")
+                    if "ufficiocamerale" not in result_data["sources"]:
+                        result_data["sources"].append("ufficiocamerale")
             except Exception:
                 pass
 
@@ -2456,6 +2514,25 @@ class DataCollector:
                 collection.results.append(result)
             except Exception as e:
                 log.error(f"[{name}] baseline error: {e}")
+
+        # ── Secondo controllo liquidazione dopo UfficioCamerale ───────────
+        # UfficioCamerale scrive in cache il segnale dall'URL slug.
+        # Ri-eseguiamo liquidation per leggere quel segnale.
+        liq_conn = self.connectors.get("liquidation")
+        if liq_conn:
+            liq_key  = liq_conn.cache.make_key("liquidation", company_name)
+            liq_prev = liq_conn.cache.get(liq_key)
+            if liq_prev:
+                try:
+                    prev = json.loads(liq_prev)
+                    if not prev.get("is_liquidation"):
+                        liq_conn.cache.delete(liq_key)
+                        r2 = liq_conn.fetch(baseline_claim, company_name)
+                        if r2.found:
+                            log.info("[liquidation] secondo passaggio: trovato")
+                            collection.results.append(r2)
+                except Exception:
+                    pass
 
         for claim in claims:
             # Converti in dict se è un dataclass
