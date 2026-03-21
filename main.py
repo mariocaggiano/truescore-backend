@@ -268,6 +268,7 @@ async def run_pipeline(
         )
         # Inietta URL per enrichers supplementari
         verification._website_url  = website_url or ""
+        verification.tone_analysis = extraction.tone_analysis
         verification._linkedin_url = linkedin_url or ""
 
         _emit(job_id, 3, "done",
@@ -321,6 +322,7 @@ async def run_pipeline(
             "job_postings": verification.job_postings,
             "email_domain": verification.email_domain,
             "tech_stack":   verification.tech_stack,
+            "tone_analysis": verification.tone_analysis,
             "pdf_ready":    True,
             "report_id":    config.report_id,
             "generated_at": config.generated_at,
