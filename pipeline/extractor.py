@@ -421,8 +421,16 @@ ESTRAI affermazioni che riguardano:
 NON estrarre:
 - Opinioni soggettive ("siamo i migliori", "leader del mercato")
 - Proiezioni future ("prevediamo di raggiungere")
-- Affermazioni non quantificate ("molti clienti", "grande rete")
 - Piani strategici o intenzioni
+
+ESTRAI ANCHE (con specificity "low"):
+- Affermazioni quantificate in modo approssimativo: "decine di clienti" → partner_count, normalized_value: null
+- Range numerici: "tra 20 e 30 persone" → team_size, normalized_value: "25" (valore medio)
+- Numeri menzionati in contesto: "serviamo 50 aziende" → partner_count even if informal
+- Anni di attività come proxy: "fondata nel 2018" → notes: "6 anni di attività"
+
+Se il testo è in italiano, estrai comunque le claim in italiano.
+Se il testo non ha NESSUN numero o quantità, allora restituisci [].
 
 Per ogni claim estratta rispondi con questo JSON (array, anche se c'è un solo elemento):
 [
