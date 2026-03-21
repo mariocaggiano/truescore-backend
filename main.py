@@ -565,6 +565,65 @@ async def parse_opencorporates(
     return {"found": False, "data": None}
 
 
+
+@app.post("/api/debug/parse-document")
+async def debug_parse_document(
+    file: UploadFile = File(...),
+    doc_type: str = Form("bilancio"),
+):
+    """
+    DEBUG: mostra il testo estratto da un PDF + risultati regex finanziaria.
+    Utile per capire perché ricavi=None.
+    Endpoint temporaneo — rimuovere in produzione.
+    """
+    import tempfile, os
+    from pathlib import Path
+
+    raw = await file.read()
+    suffix = Path(file.filename).suffix.lower()
+
+    # Scrivi in temp file
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(raw)
+        tmp_path = tmp.name
+
+    try:
+        from extractor import DocumentIngester, ClaimExtractor
+
+        if suffix == ".pdf":
+            text, method = DocumentIngester.from_pdf(tmp_path)
+        else:
+            text = raw.decode("utf-8", errors="replace")
+            method = "text"
+
+        # Mostra prime 3000 chars del testo estratto
+        excerpt = text[:3000]
+
+        # Prova regex
+        regex_result = ClaimExtractor._extract_financials_regex(text)
+
+        # Trova la sezione più rilevante
+        eco_markers = ["conto economico", "ricavi", "valore della produzione",
+                       "proventi", "fatturato", "a) ricavi"]
+        text_lower = text.lower()
+        found_markers = {}
+        for marker in eco_markers:
+            idx = text_lower.find(marker)
+            if idx > 0:
+                found_markers[marker] = text[max(0,idx-50):idx+200]
+
+        return {
+            "filename":       file.filename,
+            "extraction_method": method,
+            "total_chars":    len(text),
+            "text_excerpt":   excerpt,
+            "regex_result":   regex_result,
+            "markers_found":  found_markers,
+            "first_500_chars": text[:500],
+        }
+    finally:
+        os.unlink(tmp_path)
+
 # ─────────────────────────────────────────────
 #  Endpoint di diagnostica
 # ─────────────────────────────────────────────
@@ -604,6 +663,65 @@ async def parse_opencorporates(
         return {"found": True, "data": data}
     return {"found": False, "data": None}
 
+
+
+@app.post("/api/debug/parse-document")
+async def debug_parse_document(
+    file: UploadFile = File(...),
+    doc_type: str = Form("bilancio"),
+):
+    """
+    DEBUG: mostra il testo estratto da un PDF + risultati regex finanziaria.
+    Utile per capire perché ricavi=None.
+    Endpoint temporaneo — rimuovere in produzione.
+    """
+    import tempfile, os
+    from pathlib import Path
+
+    raw = await file.read()
+    suffix = Path(file.filename).suffix.lower()
+
+    # Scrivi in temp file
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(raw)
+        tmp_path = tmp.name
+
+    try:
+        from extractor import DocumentIngester, ClaimExtractor
+
+        if suffix == ".pdf":
+            text, method = DocumentIngester.from_pdf(tmp_path)
+        else:
+            text = raw.decode("utf-8", errors="replace")
+            method = "text"
+
+        # Mostra prime 3000 chars del testo estratto
+        excerpt = text[:3000]
+
+        # Prova regex
+        regex_result = ClaimExtractor._extract_financials_regex(text)
+
+        # Trova la sezione più rilevante
+        eco_markers = ["conto economico", "ricavi", "valore della produzione",
+                       "proventi", "fatturato", "a) ricavi"]
+        text_lower = text.lower()
+        found_markers = {}
+        for marker in eco_markers:
+            idx = text_lower.find(marker)
+            if idx > 0:
+                found_markers[marker] = text[max(0,idx-50):idx+200]
+
+        return {
+            "filename":       file.filename,
+            "extraction_method": method,
+            "total_chars":    len(text),
+            "text_excerpt":   excerpt,
+            "regex_result":   regex_result,
+            "markers_found":  found_markers,
+            "first_500_chars": text[:500],
+        }
+    finally:
+        os.unlink(tmp_path)
 
 # ─────────────────────────────────────────────
 #  Endpoint di diagnostica
