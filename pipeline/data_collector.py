@@ -2333,6 +2333,102 @@ class WaybackConnector(BaseConnector):
 
 
 
+
+# ─────────────────────────────────────────────
+#  Helpers standalone per LiquidationChecker
+#  (evitano forward reference a UfficioCameraleConnector)
+# ─────────────────────────────────────────────
+
+_NEGATIVE_SLUG_SUFFIXES = [
+    "", "-srl", "-s-r-l", "-spa",
+    "-in-liquidazione", "-srl-in-liquidazione", "-s-r-l-in-liquidazione",
+    "-spa-in-liquidazione", "-in-liquidazione-volontaria", "-in-liquidazione-giudiziale",
+    "-fallita", "-fallimento", "-srl-fallita", "-in-fallimento",
+    "-sciolta", "-scioglimento", "-in-scioglimento",
+    "-cancellata", "-cancellata-dal-registro",
+    "-cessata", "-cessazione", "-attivita-cessata",
+    "-concordato-preventivo", "-in-concordato",
+]
+
+_NEGATIVE_STATUS_WORDS = [
+    "in-liquidazione", "liquidazione", "fallita", "fallimento",
+    "sciolta", "cancellata", "cessata", "concordato",
+]
+
+def _to_slug_standalone(name: str) -> str:
+    slug = name.lower()
+    for suffix in [" s.r.l.", " srl", " s.p.a.", " spa",
+                   " s.n.c.", " snc", " s.a.s.", " sas", " s.r.l"]:
+        slug = slug.replace(suffix, "")
+    for old, new in [("à","a"),("è","e"),("é","e"),("ì","i"),("ò","o"),("ù","u")]:
+        slug = slug.replace(old, new)
+    slug = re.sub(r"[^a-z0-9]+", "-", slug).strip("-")
+    return slug
+
+
+def _find_uc_id_standalone(slug: str, vat_number: str, cache, timeout: int) -> Optional[str]:
+    headers = {
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0",
+        "Accept-Language": "it-IT,it;q=0.9",
+        "Referer":         "https://www.google.it/",
+    }
+    queries = [
+        f"ufficiocamerale.it/{slug}",
+        f"ufficiocamerale.it {vat_number[-8:]}",
+    ]
+    for query in queries:
+        try:
+            url  = f"https://www.google.com/search?q={quote_plus(query)}&num=5&hl=it"
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            if resp.status_code != 200:
+                time.sleep(1)
+                continue
+            # Cerca sia nei link che nel testo della pagina
+            m = re.search(r"ufficiocamerale[.]it/([0-9]+)/", resp.text)
+            if m:
+                return m.group(1)
+            time.sleep(1)
+        except Exception:
+            continue
+    return None
+
+
+def _probe_slug_variants_standalone(
+    uc_id: str, slug_base: str, vat_number: str, cache, timeout: int
+) -> Optional[str]:
+    headers = {
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0",
+        "Accept-Language": "it-IT,it;q=0.9",
+    }
+    base_url = f"https://www.ufficiocamerale.it/{uc_id}/{slug_base}"
+    for suffix in _NEGATIVE_SLUG_SUFFIXES:
+        url = base_url + suffix
+        try:
+            time.sleep(0.4)
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            if resp.status_code == 200 and len(resp.text) > 500:
+                if vat_number[-8:] in resp.text or slug_base[:5] in resp.text.lower():
+                    log.info(f"UfficioCamerale slug probe: trovata pagina {url}")
+                    # Segnala stato negativo in cache
+                    status_word = next(
+                        (s for s in _NEGATIVE_STATUS_WORDS if s in url), None
+                    )
+                    if status_word:
+                        liq_key = cache.make_key("liquidation_url_signal", vat_number)
+                        cache.set(liq_key, json.dumps({
+                            "signal":     f"{status_word} (da slug probe)",
+                            "url":        url,
+                            "vat_number": vat_number,
+                        }))
+                        log.warning(
+                            f"UfficioCamerale: stato NEGATIVO rilevato "                            f"({status_word}) — {url}"
+                        )
+                    return url
+        except Exception:
+            continue
+    return None
+
+
 # ─────────────────────────────────────────────
 #  Connettore 9 — Liquidation Checker
 # ─────────────────────────────────────────────
@@ -2404,17 +2500,46 @@ class LiquidationChecker(BaseConnector):
             "confidence":     0.0,
         }
 
-        # ── 1. Ricerca diretta su Google site:ufficiocamerale.it ──────────
-        # Non usa il proxy (deadlock), fa richieste HTTP dirette.
-        vat_early = claim.get("vat_number", "")
-        if vat_early:
-            uc_signals = self._check_ufficiocamerale_direct(company_name, vat_early)
+        vat = claim.get("vat_number", "")
+
+        # ── 1. Slug probe DIRETTO su ufficiocamerale.it ───────────────────
+        # Strategia principale: costruisce URL con tutte le varianti di stato
+        # e prova se il server risponde. Non dipende da Google.
+        # Richiede solo l'ID numerico della pagina, che cerchiamo prima via Google.
+        if vat:
+            try:
+                slug_base = _to_slug_standalone(company_name)
+                uc_id     = _find_uc_id_standalone(slug_base, vat, self.cache, self.timeout)
+                if uc_id:
+                    found_url = _probe_slug_variants_standalone(
+                        uc_id, slug_base, vat, self.cache, self.timeout
+                    )
+                    if found_url:
+                        liq_key_pre = self.cache.make_key("liquidation_url_signal", vat)
+                        liq_pre     = self.cache.get(liq_key_pre)
+                        if liq_pre:
+                            liq_info = json.loads(liq_pre)
+                            result_data["signals"].append(
+                                f"UfficioCamerale slug probe: {liq_info.get('signal','')} "
+                                f"— {found_url}"
+                            )
+                            result_data["sources"].append("ufficiocamerale_probe")
+                    log.info(
+                        f"LiquidationChecker: slug probe completato per "
+                        f"'{company_name}' (ID={uc_id}, url={found_url})"
+                    )
+            except Exception as e:
+                log.debug(f"LiquidationChecker slug probe error: {e}")
+
+        # ── 1b. Google site:ufficiocamerale.it come fallback ──────────────
+        if not result_data["signals"] and vat:
+            uc_signals = self._check_ufficiocamerale_direct(company_name, vat)
             if uc_signals:
                 result_data["signals"].extend(uc_signals)
                 result_data["sources"].append("ufficiocamerale_google")
 
-        # ── 1b. Google generico se non trovato da site: search ────────────
-        if not result_data["signals"] and proxy_base:
+        # ── 1c. Google generico come ultimo fallback ──────────────────────
+        if not result_data["signals"]:
             google_signals = self._check_google_direct(company_name)
             if google_signals:
                 result_data["signals"].extend(google_signals)
@@ -2440,8 +2565,6 @@ class LiquidationChecker(BaseConnector):
                 pass
 
         # ── 3. Controlla cache UfficioCamerale (stato + segnale URL slug) ──────
-        vat = claim.get("vat_number","")
-
         # Segnale da URL slug (scritto da UfficioCamerale._scrape_company_data)
         liq_url_key = self.cache.make_key("liquidation_url_signal", vat)
         liq_url_data = self.cache.get(liq_url_key)
