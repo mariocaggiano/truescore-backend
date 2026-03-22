@@ -115,6 +115,88 @@ def _job_update(job_id: str, **kwargs):
         JOBS[job_id]["updated_at"] = time.time()
 
 
+def _check_coherence(company_name: str, vat_number: str,
+                     financial_data) -> list[dict]:
+    """
+    Verifica che i dati inseriti dall'utente siano coerenti tra loro:
+    - La P.IVA nel bilancio corrisponde a quella inserita
+    - Il nome azienda nel bilancio corrisponde a quello inserito
+    - Il bilancio non è troppo datato (>5 anni = avviso)
+    """
+    issues = []
+    if not financial_data:
+        return issues
+
+    from datetime import date
+    current_year = date.today().year
+
+    vat_in_doc     = (financial_data.vat_in_doc or "").strip()
+    company_in_doc = (financial_data.company_in_doc or "").strip().lower()
+    exercise_year  = financial_data.exercise_year
+
+    # ── 1. P.IVA: bilancio vs inserita ───────────────────────────────────
+    if vat_number and vat_in_doc and vat_number.strip() != vat_in_doc:
+        issues.append({
+            "type":     "vat_mismatch",
+            "severity": "critical",
+            "message":  f"P.IVA inserita ({vat_number}) diversa da quella nel bilancio ({vat_in_doc})",
+            "declared": vat_number,
+            "found":    vat_in_doc,
+        })
+
+    # ── 2. Nome azienda: bilancio vs inserito ─────────────────────────────
+    if company_name and company_in_doc:
+        # Normalizza: rimuovi forma giuridica, lowercase, strip
+        import re
+        def norm(s):
+            s = s.lower()
+            for suffix in [" s.r.l.", " srl", " s.p.a.", " spa", " srls",
+                           " s.n.c.", " snc", "s.r.l", "s.p.a"]:
+                s = s.replace(suffix, "")
+            return re.sub(r"[^a-z0-9\s]", "", s).strip()
+
+        name_norm = norm(company_name)
+        doc_norm  = norm(company_in_doc)
+
+        # Match parziale: almeno 60% delle parole del nome inserito nel doc
+        name_words = set(name_norm.split())
+        doc_words  = set(doc_norm.split())
+        if name_words:
+            overlap = len(name_words & doc_words) / len(name_words)
+            if overlap < 0.5:
+                issues.append({
+                    "type":     "name_mismatch",
+                    "severity": "warning",
+                    "message":  f"Nome azienda inserito ('{company_name}') non corrisponde al bilancio ('{financial_data.company_in_doc}')",
+                    "declared": company_name,
+                    "found":    financial_data.company_in_doc,
+                })
+
+    # ── 3. Anno bilancio: troppo datato? ─────────────────────────────────
+    if exercise_year:
+        age = current_year - exercise_year
+        if age > 5:
+            issues.append({
+                "type":     "stale_balance_sheet",
+                "severity": "warning",
+                "message":  f"Il bilancio è relativo all'esercizio {exercise_year} ({age} anni fa). I dati potrebbero non essere rappresentativi della situazione attuale.",
+                "year":     exercise_year,
+                "age_years": age,
+            })
+        elif age > 2:
+            issues.append({
+                "type":     "dated_balance_sheet",
+                "severity": "info",
+                "message":  f"Il bilancio è dell'esercizio {exercise_year} ({age} anni fa).",
+                "year":     exercise_year,
+                "age_years": age,
+            })
+
+    return issues
+
+
+
+
 def _emit(job_id: str, step: int, status: str, detail: str):
     """Aggiorna step nel job e logga."""
     _job_update(job_id,
@@ -176,6 +258,16 @@ async def run_pipeline(
             declarative_sources=declarative,
             probatory_sources=probatory,
         )
+
+        # ── Controllo coerenza dati ────────────────────────────────────────
+        coherence_issues = _check_coherence(
+            company_name=company_name,
+            vat_number=vat_number or "",
+            financial_data=extraction.financial_data,
+        )
+        if coherence_issues:
+            for issue in coherence_issues:
+                log.warning(f"[{job_id[:8]}] Coerenza: {issue['message']}")
 
         claim_count = len(extraction.claims)
         _emit(job_id, 1, "done", f"{claim_count} claim estratte")
@@ -270,9 +362,10 @@ async def run_pipeline(
             sector=sector or "default",
         )
         # Inietta URL per enrichers supplementari
-        verification._website_url  = website_url or ""
-        verification.tone_analysis = extraction.tone_analysis
-        verification._linkedin_url = linkedin_url or ""
+        verification._website_url    = website_url or ""
+        verification.tone_analysis   = extraction.tone_analysis
+        verification._linkedin_url   = linkedin_url or ""
+        verification.coherence_issues = coherence_issues
 
         _emit(job_id, 3, "done",
               f"Trust Score: {verification.trust_score:.1f}/10")
@@ -326,6 +419,7 @@ async def run_pipeline(
             "email_domain": verification.email_domain,
             "tech_stack":   verification.tech_stack,
             "tone_analysis": verification.tone_analysis,
+            "coherence_issues": verification.coherence_issues,
             "pdf_ready":    True,
             "report_id":    config.report_id,
             "generated_at": config.generated_at,
