@@ -936,23 +936,43 @@ class ClaimExtractor:
         Estrae P.IVA e nome azienda dall'intestazione di un bilancio Infocamere.
         Formato tipico: "[ SIG] NOME SOCIETA SRL VIA ... RM 12345678901 12345678901"
         """
-        vat    = ""
-        name   = ""
-        lines  = text[:1500].split("\n")
+        vat  = ""
+        name = ""
 
-        for line in lines[:20]:
+        lines = text[:1500].split("\n")
+        for line in lines[:25]:
+            line = line.strip()
+            if not line:
+                continue
+
             # P.IVA: 11 cifre consecutive
-            m_vat = re.findall(r"\b(\d{11})\b", line)
-            if m_vat and not vat:
-                vat = m_vat[0]
+            if not vat:
+                m_vat = re.findall(r"\b(\d{11})\b", line)
+                if m_vat:
+                    vat = m_vat[0]
 
-            # Nome azienda: riga con [XXX] seguito da nome in maiuscolo
-            m_name = re.match(
-                r"\[?\s*[A-Z]{2,5}\s*\]?\s+([A-Z][A-Z\s\.]{4,50?}(?:SRL|SPA|SNC|SAS|SRLS|S\.R\.L\.|S\.P\.A\.))",
-                line.strip(), re.IGNORECASE
-            )
-            if m_name and not name:
-                name = m_name.group(1).strip()
+            # Nome azienda: riga con [XXX] seguito da NOME SRL/SPA/etc
+            # Formato: "[ REV] REVOTREE SRL VIA MARSALA..."
+            if not name:
+                # Pattern: [sigla] NOME FORMA_GIURIDICA (poi VIA/PIAZZA/CF/etc)
+                m = re.match(
+                    r"\[?\s*\w+\s*\]?\s+"
+                    r"((?:[A-Z0-9À-Ù&'\-]+\s+)+"
+                    r"(?:SRL|SPA|SNC|SAS|SRLS|SOCIETA'|S\.R\.L\.|S\.P\.A\.|S\.N\.C\.))"
+                    r"(?:\s+(?:VIA|PIAZZA|CORSO|STR|LOC|FRAZ|P\.IVA|CF|\d))",
+                    line, re.IGNORECASE
+                )
+                if m:
+                    name = m.group(1).strip()
+                else:
+                    # Fallback: cerca direttamente NOME + forma giuridica ovunque nella riga
+                    m2 = re.search(
+                        r"\b((?:[A-Z][A-Z0-9À-Ù&'\-]+\s+){1,5}"
+                        r"(?:SRL|SPA|SNC|SAS|SRLS|S\.R\.L\.|S\.P\.A\.))\b",
+                        line, re.IGNORECASE
+                    )
+                    if m2:
+                        name = m2.group(1).strip()
 
         return vat, name
 
