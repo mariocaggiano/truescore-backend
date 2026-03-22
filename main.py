@@ -425,6 +425,8 @@ async def run_pipeline(
             "generated_at": config.generated_at,
         }
 
+        log.info(f"[{job_id[:8]}] coherence_issues nel result: {len(verification.coherence_issues)} issues")
+
         _job_update(job_id,
             status="done",
             result=result_dict,
