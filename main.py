@@ -367,7 +367,7 @@ async def create_share(job_id: str):
     import secrets, datetime
 
     # Cerca il risultato nel job store
-    job = JOB_STORE.get(job_id)
+    job = JOBS.get(job_id)
     if not job or job.get("status") != "done":
         raise HTTPException(404, "Report non trovato o non ancora completato")
 
