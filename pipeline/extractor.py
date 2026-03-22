@@ -75,6 +75,8 @@ class FinancialData:
     share_capital: Optional[float]     = None
     extraction_confidence: float       = 0.0
     raw_excerpt: str                   = ""
+    vat_in_doc: str                    = ""   # P.IVA estratta dal documento
+    company_in_doc: str                = ""   # nome azienda estratto dal documento
 
 
 @dataclass
@@ -899,6 +901,9 @@ class ClaimExtractor:
             if employees is None and regex_data.get("employees"):
                 employees = regex_data["employees"]
 
+            # Estrai P.IVA e nome azienda dall'intestazione del bilancio
+            vat_in_doc, company_in_doc = ClaimExtractor._extract_identity_from_doc(text)
+
             return FinancialData(
                 source_document=doc_label,
                 exercise_year=data.get("exercise_year") or regex_data.get("year"),
@@ -909,10 +914,11 @@ class ClaimExtractor:
                 share_capital=self._to_float(data.get("share_capital")),
                 extraction_confidence=float(data.get("extraction_confidence", 0.5)),
                 raw_excerpt=data.get("raw_excerpt", ""),
+                vat_in_doc=vat_in_doc,
+                company_in_doc=company_in_doc,
             )
         except Exception as e:
             log.error(f"Errore estrazione dati finanziari: {e}")
-            # Restituisci almeno i dati da regex se disponibili
             if regex_data:
                 return FinancialData(
                     source_document=doc_label,
@@ -923,6 +929,32 @@ class ClaimExtractor:
                     raw_excerpt="Estratto via regex",
                 )
             return None
+
+    @staticmethod
+    def _extract_identity_from_doc(text: str) -> tuple[str, str]:
+        """
+        Estrae P.IVA e nome azienda dall'intestazione di un bilancio Infocamere.
+        Formato tipico: "[ SIG] NOME SOCIETA SRL VIA ... RM 12345678901 12345678901"
+        """
+        vat    = ""
+        name   = ""
+        lines  = text[:1500].split("\n")
+
+        for line in lines[:20]:
+            # P.IVA: 11 cifre consecutive
+            m_vat = re.findall(r"\b(\d{11})\b", line)
+            if m_vat and not vat:
+                vat = m_vat[0]
+
+            # Nome azienda: riga con [XXX] seguito da nome in maiuscolo
+            m_name = re.match(
+                r"\[?\s*[A-Z]{2,5}\s*\]?\s+([A-Z][A-Z\s\.]{4,50?}(?:SRL|SPA|SNC|SAS|SRLS|S\.R\.L\.|S\.P\.A\.))",
+                line.strip(), re.IGNORECASE
+            )
+            if m_name and not name:
+                name = m_name.group(1).strip()
+
+        return vat, name
 
     @staticmethod
     def _extract_financials_regex(text: str) -> dict:
