@@ -71,6 +71,9 @@ app.add_middleware(
 JOBS: dict[str, dict] = {}
 REPORTS_DIR = Path(tempfile.gettempdir()) / "truescore_reports"
 REPORTS_DIR.mkdir(exist_ok=True)
+SHARES_DIR  = Path(tempfile.gettempdir()) / "truescore_shares"
+SHARES_DIR.mkdir(exist_ok=True)
+SHARE_TTL_HOURS = 72   # link valido 72 ore
 
 
 # ─────────────────────────────────────────────
@@ -349,6 +352,76 @@ async def run_pipeline(
 @app.get("/health")
 def health():
     return {"status": "ok", "version": "0.1.0"}
+
+
+# ─────────────────────────────────────────────
+#  Share endpoints
+# ─────────────────────────────────────────────
+
+@app.post("/api/share/{job_id}")
+async def create_share(job_id: str):
+    """
+    Crea un link condivisibile per un report già completato.
+    Il link dura SHARE_TTL_HOURS ore.
+    """
+    import secrets, datetime
+
+    # Cerca il risultato nel job store
+    job = JOB_STORE.get(job_id)
+    if not job or job.get("status") != "done":
+        raise HTTPException(404, "Report non trovato o non ancora completato")
+
+    # Genera token e salva
+    token = secrets.token_urlsafe(12)
+    share_data = {
+        "token":      token,
+        "job_id":     job_id,
+        "result":     job.get("result"),
+        "created_at": datetime.datetime.utcnow().isoformat(),
+        "expires_at": (datetime.datetime.utcnow()
+                       + datetime.timedelta(hours=SHARE_TTL_HOURS)).isoformat(),
+    }
+
+    share_path = SHARES_DIR / f"{token}.json"
+    share_path.write_text(json.dumps(share_data, ensure_ascii=False), encoding="utf-8")
+
+    log.info(f"Share creato: {token} per job {job_id[:8]}")
+    return {"token": token, "ttl_hours": SHARE_TTL_HOURS}
+
+
+@app.get("/api/share/{token}")
+async def get_share(token: str):
+    """
+    Recupera un report condiviso tramite token.
+    Restituisce 404 se scaduto o inesistente.
+    """
+    import datetime, re
+
+    # Sicurezza: token solo alfanumerico + trattini
+    if not re.match(r'^[A-Za-z0-9_-]{10,20}$', token):
+        raise HTTPException(400, "Token non valido")
+
+    share_path = SHARES_DIR / f"{token}.json"
+    if not share_path.exists():
+        raise HTTPException(404, "Link non trovato o scaduto")
+
+    data = json.loads(share_path.read_text(encoding="utf-8"))
+
+    # Controlla scadenza
+    expires = datetime.datetime.fromisoformat(data["expires_at"])
+    if datetime.datetime.utcnow() > expires:
+        share_path.unlink(missing_ok=True)
+        raise HTTPException(404, "Link scaduto")
+
+    # Calcola ore rimanenti
+    remaining_hours = max(0, int((expires - datetime.datetime.utcnow()).total_seconds() / 3600))
+
+    return {
+        "result":          data["result"],
+        "created_at":      data["created_at"],
+        "expires_at":      data["expires_at"],
+        "remaining_hours": remaining_hours,
+    }
 
 
 @app.post("/api/analyze")
