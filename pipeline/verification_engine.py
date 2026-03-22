@@ -111,6 +111,7 @@ class VerificationResult:
     email_domain: Optional[dict]      = None   # verifica DNS email
     tech_stack: Optional[dict]        = None   # tecnologie sito web
     tone_analysis: Optional[dict]     = None   # analisi tono pitch deck
+    coherence_issues: list[dict]      = field(default_factory=list)  # problemi coerenza dati
 
     def summary(self) -> str:
         lines = [
@@ -147,6 +148,7 @@ class VerificationResult:
             "email_domain": self.email_domain,
             "tech_stack":   self.tech_stack,
             "tone_analysis": self.tone_analysis,
+            "coherence_issues": self.coherence_issues,
             "errors": self.errors,
         }
 
