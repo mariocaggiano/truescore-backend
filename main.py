@@ -360,12 +360,12 @@ async def run_pipeline(
             claims=extraction.claims,
             collection=collection,
             sector=sector or "default",
+            coherence_issues=coherence_issues,
         )
         # Inietta URL per enrichers supplementari
         verification._website_url    = website_url or ""
         verification.tone_analysis   = extraction.tone_analysis
         verification._linkedin_url   = linkedin_url or ""
-        verification.coherence_issues = coherence_issues
 
         _emit(job_id, 3, "done",
               f"Trust Score: {verification.trust_score:.1f}/10")
