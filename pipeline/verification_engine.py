@@ -1213,9 +1213,12 @@ class VerificationEngine:
         claims: list,
         collection,
         sector: str = "default",
+        coherence_issues: list = None,
     ) -> VerificationResult:
 
         result = VerificationResult(company_name=company_name)
+        if coherence_issues:
+            result.coherence_issues = coherence_issues
 
         # Normalizza i collector results in una lista di dict
         if hasattr(collection, "results"):
@@ -1293,6 +1296,31 @@ class VerificationEngine:
 
         # ── Calcola Trust Score ───────────────────────────────────────────
         result.trust_score = self._compute_trust_score(result.verdicts)
+
+        # ── Applica penalità per problemi di coerenza ─────────────────────
+        if result.coherence_issues and result.trust_score >= 0:
+            penalty = 0.0
+            for issue in result.coherence_issues:
+                sev = issue.get("severity", "")
+                t   = issue.get("type", "")
+                if sev == "critical":
+                    penalty += 3.0   # P.IVA sbagliata: -3 punti
+                elif t == "name_mismatch":
+                    penalty += 2.5   # Nome azienda diverso: -2.5
+                elif t == "stale_balance_sheet":
+                    penalty += 1.5   # Bilancio >5 anni: -1.5
+                elif sev == "warning":
+                    penalty += 0.8
+                elif sev == "info":
+                    penalty += 0.2
+            if penalty > 0:
+                old_score = result.trust_score
+                result.trust_score = round(max(1.0, result.trust_score - penalty), 1)
+                log.warning(
+                    f"Trust Score penalizzato per coerenza: "
+                    f"{old_score} → {result.trust_score} (-{penalty})"
+                )
+
         result.trust_score_label = self._trust_label(result.trust_score)
 
         log.info(f"Verifica completata:\n{result.summary()}")
