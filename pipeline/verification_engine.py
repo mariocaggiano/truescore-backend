@@ -1301,7 +1301,16 @@ class VerificationEngine:
 
         # ── Cross-metric consistency checks ─────────────────────────────────
         try:
-            from cross_checks import CrossMetricChecker
+            import importlib, sys, os
+            # Assicura che la directory del modulo sia nel path
+            _mod_dir = os.path.dirname(os.path.abspath(__file__))
+            if _mod_dir not in sys.path:
+                sys.path.insert(0, _mod_dir)
+            if "cross_checks" in sys.modules:
+                _cc_mod = sys.modules["cross_checks"]
+            else:
+                _cc_mod = importlib.import_module("cross_checks")
+            CrossMetricChecker = _cc_mod.CrossMetricChecker
             checker = CrossMetricChecker(llm=getattr(self, "llm", None))
             cross = checker.run(
                 extraction_result=getattr(self, "_last_extraction", None),
@@ -1315,7 +1324,7 @@ class VerificationEngine:
                     f"{sum(1 for c in cross if c.severity in ('critical','high'))} critiche/alte"
                 )
         except Exception as _ce:
-            log.debug(f"CrossMetricChecker: {_ce}")
+            log.warning(f"CrossMetricChecker ERROR: {type(_ce).__name__}: {_ce}")
 
         # ── Applica penalità per problemi di coerenza ─────────────────────
         if result.coherence_issues and result.trust_score >= 0:
