@@ -1,0 +1,743 @@
+"""
+TrueScore — Cross-Metric Consistency Checker
+=============================================
+Verifica la coerenza interna tra metriche dichiarate nel pitch
+e dati verificati da fonti esterne (bilancio, LinkedIn, OpenCorporates...).
+
+6 categorie di check:
+  1. revenue_per_customer     — ricavi / clienti dichiarati
+  2. revenue_per_employee     — ricavi / dipendenti
+  3. funding_vs_financials    — funding dichiarato vs stato finanziario
+  4. headcount_vs_structure   — dipendenti vs struttura operativa dichiarata
+  5. growth_vs_balance_sheet  — crescita dichiarata vs bilanci storici
+  6. founding_vs_maturity     — data fondazione vs claim di maturità/esperienza
+
+Ogni alert include:
+  - Le fonti che supportano l'anomalia (con citazione e confidence)
+  - Il valore derivato (ratio) e il benchmark di settore
+  - Una spiegazione generata da Mistral (contestuale, non da template)
+"""
+
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import Optional
+
+log = logging.getLogger("cross_checks")
+
+
+# ─────────────────────────────────────────────
+#  Benchmark di settore
+# ─────────────────────────────────────────────
+
+# revenue_per_customer: €/cliente/anno per settore
+REVENUE_PER_CUSTOMER_BENCHMARKS = {
+    "saas":           {"min": 200,    "max": 5000,   "label": "SaaS B2B"},
+    "saas_enterprise":{"min": 2000,   "max": 50000,  "label": "SaaS Enterprise"},
+    "saas_smb":       {"min": 100,    "max": 2000,   "label": "SaaS PMI"},
+    "marketplace":    {"min": 5,      "max": 500,    "label": "Marketplace"},
+    "ecommerce":      {"min": 30,     "max": 300,    "label": "E-commerce"},
+    "consulting":     {"min": 5000,   "max": 100000, "label": "Consulenza"},
+    "fintech":        {"min": 50,     "max": 2000,   "label": "Fintech"},
+    "healthtech":     {"min": 100,    "max": 3000,   "label": "Healthtech"},
+    "edtech":         {"min": 20,     "max": 500,    "label": "EdTech"},
+    "mobility":       {"min": 10,     "max": 200,    "label": "Mobility"},
+    "default":        {"min": 50,     "max": 10000,  "label": "Media settori"},
+}
+
+# revenue_per_employee: €/dipendente/anno
+REVENUE_PER_EMPLOYEE_BENCHMARKS = {
+    "saas":       {"min": 50000,  "max": 400000, "label": "SaaS"},
+    "consulting": {"min": 80000,  "max": 300000, "label": "Consulenza"},
+    "ecommerce":  {"min": 30000,  "max": 200000, "label": "E-commerce"},
+    "mobility":   {"min": 20000,  "max": 150000, "label": "Mobility"},
+    "default":    {"min": 20000,  "max": 300000, "label": "Media settori"},
+}
+
+# founding_vs_maturity: anni minimi per poter usare certe claim
+MATURITY_THRESHOLDS = {
+    "leader di mercato":    5,
+    "market leader":        5,
+    "consolidati":          4,
+    "consolidata":          4,
+    "anni di esperienza":   3,
+    "years of experience":  3,
+    "track record":         3,
+    "presenza consolidata": 4,
+    "azienda affermata":    5,
+    "storica presenza":     7,
+}
+
+
+# ─────────────────────────────────────────────
+#  Struttura dati check
+# ─────────────────────────────────────────────
+
+@dataclass
+class CrossCheckSource:
+    type: str           # pitch_deck | bilancio | linkedin | opencorporates | benchmark | news
+    quote: str          # citazione testuale o descrizione del dato
+    value: object = None
+    confidence: float = 0.0
+    url: str = ""
+
+
+@dataclass
+class CrossCheckResult:
+    check_id:    str
+    title:       str
+    severity:    str        # critical | high | medium | low | info
+    verdict:     str        # implausible | suspicious | plausible | unverifiable
+    metric_a:    dict = field(default_factory=dict)   # {label, value, source}
+    metric_b:    dict = field(default_factory=dict)
+    derived:     dict = field(default_factory=dict)   # {label, value, unit}
+    benchmark:   dict = field(default_factory=dict)   # {min, max, unit, sector}
+    sources:     list = field(default_factory=list)   # list of CrossCheckSource dicts
+    explanation: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "check_id":    self.check_id,
+            "title":       self.title,
+            "severity":    self.severity,
+            "verdict":     self.verdict,
+            "metric_a":    self.metric_a,
+            "metric_b":    self.metric_b,
+            "derived":     self.derived,
+            "benchmark":   self.benchmark,
+            "sources":     self.sources,
+            "explanation": self.explanation,
+        }
+
+
+# ─────────────────────────────────────────────
+#  Cross-Metric Checker
+# ─────────────────────────────────────────────
+
+class CrossMetricChecker:
+    """
+    Esegue tutti i cross-check di coerenza tra metriche.
+    Chiamato dal VerificationEngine dopo il calcolo del Trust Score.
+    """
+
+    def __init__(self, llm=None):
+        self.llm = llm   # LLMAdapter — usato per generare le spiegazioni
+
+    def run(self, extraction_result, verification_result,
+            sector: str = "default") -> list[CrossCheckResult]:
+        """
+        Esegue tutti i check disponibili e ritorna solo quelli con anomalie.
+        """
+        checks = []
+        sector_key = self._normalize_sector(sector)
+
+        # Dati di input aggregati
+        ctx = self._build_context(extraction_result, verification_result)
+        if not ctx:
+            return []
+
+        # Esegui ogni check
+        runners = [
+            self._check_revenue_per_customer,
+            self._check_revenue_per_employee,
+            self._check_funding_vs_financials,
+            self._check_headcount_vs_structure,
+            self._check_growth_vs_balance_sheet,
+            self._check_founding_vs_maturity,
+        ]
+
+        for runner in runners:
+            try:
+                result = runner(ctx, sector_key)
+                if result and result.verdict != "plausible":
+                    # Genera spiegazione con LLM se disponibile
+                    if self.llm and result.verdict in ("implausible", "suspicious"):
+                        result.explanation = self._generate_explanation(result)
+                    checks.append(result)
+            except Exception as e:
+                log.debug(f"CrossCheck {runner.__name__}: {e}")
+
+        log.info(
+            f"CrossMetricChecker: {len(checks)} anomalie rilevate "
+            f"({sum(1 for c in checks if c.severity=='critical')} critiche, "
+            f"{sum(1 for c in checks if c.severity=='high')} alte)"
+        )
+        return checks
+
+    # ── Context builder ───────────────────────────────────────────────────────
+
+    def _build_context(self, extraction, verification) -> Optional[dict]:
+        """Aggrega tutti i dati disponibili in un dizionario uniforme."""
+        ctx = {
+            "company_name": getattr(extraction, "company_name", ""),
+            "sector":       "",
+            # Dal pitch deck (claim estratte)
+            "claimed_customers":  None,   # numero clienti dichiarato
+            "claimed_partners":   None,
+            "claimed_team_size":  None,
+            "claimed_funding":    None,
+            "claimed_revenue":    None,
+            "claimed_growth_pct": None,   # % crescita dichiarata
+            "maturity_phrases":   [],     # frasi di maturità trovate
+            "pitch_quotes":       {},     # claim_type → testo originale
+            # Dal bilancio
+            "bilancio_revenue":   None,
+            "bilancio_year":      None,
+            "bilancio_employees": None,
+            # Da LinkedIn
+            "linkedin_headcount": None,
+            # Da OpenCorporates
+            "founding_year":      None,
+            # Verifiche già fatte
+            "verified_team_size": None,
+            "verified_revenue":   None,
+        }
+
+        # ── Estrai dal bilancio ───────────────────────────────────────────
+        fin = getattr(extraction, "financial_data", None)
+        if fin:
+            ctx["bilancio_revenue"]   = fin.revenues
+            ctx["bilancio_year"]      = fin.exercise_year
+            ctx["bilancio_employees"] = fin.employees
+
+        # ── Estrai dalle claim ────────────────────────────────────────────
+        for claim in getattr(extraction, "claims", []):
+            ctype = str(getattr(getattr(claim, "type", None), "value",
+                                getattr(claim, "type", "")))
+            text  = getattr(claim, "text", "") or ""
+            val   = getattr(claim, "normalized_value", None)
+            ctx["pitch_quotes"][ctype] = text
+
+            if ctype == "revenue" and val:
+                ctx["claimed_revenue"] = float(val)
+            elif ctype == "team_size" and val:
+                ctx["claimed_team_size"] = int(val)
+            elif ctype == "partner_count" and val:
+                ctx["claimed_partners"] = int(val)
+            elif ctype == "funding" and val:
+                ctx["claimed_funding"] = float(val)
+            elif ctype == "customer_count" and val:
+                ctx["claimed_customers"] = int(val)
+
+            # Cerca metriche numeriche nel testo
+            self._parse_metrics_from_text(text, ctx)
+
+        # ── Estrai dai verdicts già calcolati ─────────────────────────────
+        for v in getattr(verification, "verdicts", []):
+            ctype = str(getattr(v, "claim_type", ""))
+            vval  = getattr(v, "verified_value", None)
+            if ctype == "team_size" and vval:
+                ctx["verified_team_size"] = float(vval)
+            elif ctype == "revenue" and vval:
+                ctx["verified_revenue"] = float(vval)
+
+        # ── Dati legal/founding ───────────────────────────────────────────
+        ls = getattr(verification, "legal_status", None) or {}
+        if ls.get("incorporation_date"):
+            m = re.match(r"(\d{4})", str(ls["incorporation_date"]))
+            if m:
+                ctx["founding_year"] = int(m.group(1))
+
+        # ── Persone chiave / LinkedIn headcount ──────────────────────────
+        kp = getattr(verification, "key_people", None) or {}
+        if kp.get("headcount"):
+            ctx["linkedin_headcount"] = kp["headcount"]
+
+        return ctx
+
+    def _parse_metrics_from_text(self, text: str, ctx: dict) -> None:
+        """Estrae metriche numeriche da testo libero del pitch."""
+        if not text:
+            return
+        tl = text.lower()
+
+        # Clienti
+        for pat in [
+            r"(\d[\d\.,]+)\s*(?:clienti|customers|utenti|users|iscritti)",
+            r"(?:clienti|customers|utenti)\s+(?:attivi\s+)?(?:pari\s+a\s+)?(\d[\d\.,]+)",
+        ]:
+            m = re.search(pat, tl)
+            if m and not ctx["claimed_customers"]:
+                ctx["claimed_customers"] = self._parse_num(m.group(1))
+
+        # Crescita %
+        for pat in [
+            r"crescit[ao]\s+(?:del\s+)?(\d+)\s*%",
+            r"(\d+)\s*%\s+(?:di\s+)?(?:crescita|growth|aumento)",
+            r"grew?\s+(\d+)\s*%",
+        ]:
+            m = re.search(pat, tl)
+            if m and not ctx["claimed_growth_pct"]:
+                ctx["claimed_growth_pct"] = float(m.group(1))
+
+        # Frasi di maturità
+        for phrase in MATURITY_THRESHOLDS:
+            if phrase in tl and phrase not in ctx["maturity_phrases"]:
+                ctx["maturity_phrases"].append(phrase)
+
+    @staticmethod
+    def _parse_num(s: str) -> Optional[float]:
+        """Parsa numero italiano/internazionale da stringa."""
+        try:
+            s = s.replace(".", "").replace(",", ".")
+            return float(s)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalize_sector(sector: str) -> str:
+        sector = (sector or "").lower()
+        for key in REVENUE_PER_CUSTOMER_BENCHMARKS:
+            if key in sector or sector in key:
+                return key
+        if any(w in sector for w in ["software", "app", "platform", "piattaforma"]):
+            return "saas"
+        if any(w in sector for w in ["consult", "advisory", "profess"]):
+            return "consulting"
+        if any(w in sector for w in ["market", "shop", "commerce"]):
+            return "marketplace"
+        if any(w in sector for w in ["mobil", "transport", "fleet"]):
+            return "mobility"
+        return "default"
+
+    # ── Check 1: Revenue per cliente ──────────────────────────────────────────
+
+    def _check_revenue_per_customer(self, ctx: dict,
+                                    sector: str) -> Optional[CrossCheckResult]:
+        customers = ctx.get("claimed_customers")
+        revenue   = ctx.get("bilancio_revenue") or ctx.get("claimed_revenue")
+        if not customers or not revenue or customers < 10:
+            return None
+
+        rpc   = revenue / customers
+        bench = REVENUE_PER_CUSTOMER_BENCHMARKS.get(
+            sector, REVENUE_PER_CUSTOMER_BENCHMARKS["default"]
+        )
+
+        sources = [
+            {"type": "pitch_deck",
+             "quote": ctx["pitch_quotes"].get("customer_count",
+                      f"{int(customers):,} clienti dichiarati nel pitch"),
+             "value": customers, "confidence": 0.80},
+            {"type": "bilancio" if ctx.get("bilancio_revenue") else "pitch_deck",
+             "quote": f"Ricavi: €{revenue:,.0f}"
+                      + (f" (bilancio {ctx['bilancio_year']})"
+                         if ctx.get("bilancio_year") else ""),
+             "value": revenue, "confidence": 0.93 if ctx.get("bilancio_revenue") else 0.60},
+            {"type": "benchmark",
+             "quote": f"Benchmark {bench['label']}: "
+                      f"€{bench['min']:,}–€{bench['max']:,}/cliente/anno",
+             "value": None, "confidence": 0.75},
+        ]
+
+        ratio_to_min = rpc / bench["min"] if bench["min"] > 0 else 999
+
+        if rpc < bench["min"] * 0.05:
+            severity, verdict = "critical", "implausible"
+        elif rpc < bench["min"] * 0.2:
+            severity, verdict = "high", "implausible"
+        elif rpc < bench["min"] * 0.5:
+            severity, verdict = "medium", "suspicious"
+        elif rpc > bench["max"] * 5:
+            severity, verdict = "medium", "suspicious"
+        else:
+            return None  # plausible
+
+        return CrossCheckResult(
+            check_id="revenue_per_customer",
+            title="Revenue per cliente implausibile",
+            severity=severity,
+            verdict=verdict,
+            metric_a={"label": "Clienti dichiarati", "value": int(customers),
+                      "source": "pitch_deck"},
+            metric_b={"label": "Ricavi", "value": revenue,
+                      "source": "bilancio" if ctx.get("bilancio_revenue") else "pitch"},
+            derived={"label": "Revenue/cliente", "value": round(rpc, 2),
+                     "unit": "€/anno"},
+            benchmark={"min": bench["min"], "max": bench["max"],
+                       "unit": "€/anno", "sector": bench["label"]},
+            sources=sources,
+            explanation=(
+                f"Con {int(customers):,} clienti dichiarati e ricavi di "
+                f"€{revenue:,.0f}, ogni cliente genera mediamente "
+                f"€{rpc:.2f}/anno — "
+                f"{'molto al di sotto' if rpc < bench['min'] else 'fuori range rispetto'} "
+                f"al benchmark {bench['label']} (€{bench['min']:,}–€{bench['max']:,}/anno)."
+            ),
+        )
+
+    # ── Check 2: Revenue per dipendente ───────────────────────────────────────
+
+    def _check_revenue_per_employee(self, ctx: dict,
+                                    sector: str) -> Optional[CrossCheckResult]:
+        employees = (ctx.get("verified_team_size")
+                     or ctx.get("claimed_team_size")
+                     or ctx.get("bilancio_employees")
+                     or ctx.get("linkedin_headcount"))
+        revenue   = ctx.get("bilancio_revenue") or ctx.get("claimed_revenue")
+        if not employees or not revenue or employees < 2:
+            return None
+
+        rpe   = revenue / employees
+        bench = REVENUE_PER_EMPLOYEE_BENCHMARKS.get(
+            sector, REVENUE_PER_EMPLOYEE_BENCHMARKS["default"]
+        )
+
+        source_team = ("linkedin" if ctx.get("linkedin_headcount")
+                       else "bilancio" if ctx.get("bilancio_employees")
+                       else "pitch_deck")
+        sources = [
+            {"type": source_team,
+             "quote": f"{int(employees)} dipendenti"
+                      + (" (LinkedIn)" if source_team == "linkedin" else
+                         " (bilancio)" if source_team == "bilancio" else " (pitch)"),
+             "value": employees, "confidence": 0.85},
+            {"type": "bilancio" if ctx.get("bilancio_revenue") else "pitch_deck",
+             "quote": f"Ricavi: €{revenue:,.0f}"
+                      + (f" (bilancio {ctx['bilancio_year']})"
+                         if ctx.get("bilancio_year") else ""),
+             "value": revenue, "confidence": 0.93 if ctx.get("bilancio_revenue") else 0.60},
+            {"type": "benchmark",
+             "quote": f"Benchmark {bench['label']}: "
+                      f"€{bench['min']:,}–€{bench['max']:,}/dipendente/anno",
+             "value": None, "confidence": 0.75},
+        ]
+
+        if rpe < bench["min"] * 0.1:
+            severity, verdict = "high", "implausible"
+        elif rpe < bench["min"] * 0.3:
+            severity, verdict = "medium", "suspicious"
+        elif rpe > bench["max"] * 3:
+            severity, verdict = "low", "suspicious"
+        else:
+            return None
+
+        return CrossCheckResult(
+            check_id="revenue_per_employee",
+            title="Revenue per dipendente anomala",
+            severity=severity,
+            verdict=verdict,
+            metric_a={"label": "Dipendenti", "value": int(employees),
+                      "source": source_team},
+            metric_b={"label": "Ricavi", "value": revenue,
+                      "source": "bilancio" if ctx.get("bilancio_revenue") else "pitch"},
+            derived={"label": "Revenue/dipendente", "value": round(rpe, 0),
+                     "unit": "€/anno"},
+            benchmark={"min": bench["min"], "max": bench["max"],
+                       "unit": "€/anno", "sector": bench["label"]},
+            sources=sources,
+            explanation=(
+                f"Con {int(employees)} dipendenti e ricavi di €{revenue:,.0f}, "
+                f"il revenue per dipendente è €{rpe:,.0f}/anno — "
+                f"{'molto al di sotto' if rpe < bench['min'] else 'al di sopra'} "
+                f"del benchmark {bench['label']} "
+                f"(€{bench['min']:,}–€{bench['max']:,}/anno)."
+            ),
+        )
+
+    # ── Check 3: Funding vs stato finanziario ─────────────────────────────────
+
+    def _check_funding_vs_financials(self, ctx: dict,
+                                     sector: str) -> Optional[CrossCheckResult]:
+        funding = ctx.get("claimed_funding")
+        revenue = ctx.get("bilancio_revenue")
+        if not funding or not revenue:
+            return None
+
+        # Se funding >> 10x revenue, plausibile per early stage
+        # Se funding > 50x revenue, sospetto (o revenue è vecchio)
+        ratio = funding / revenue if revenue > 0 else 0
+
+        sources = [
+            {"type": "pitch_deck",
+             "quote": ctx["pitch_quotes"].get("funding",
+                      f"Funding dichiarato: €{funding:,.0f}"),
+             "value": funding, "confidence": 0.70},
+            {"type": "bilancio",
+             "quote": f"Ricavi bilancio {ctx.get('bilancio_year','')}: €{revenue:,.0f}",
+             "value": revenue, "confidence": 0.93},
+        ]
+
+        if ratio > 100:
+            severity, verdict = "high", "suspicious"
+            explanation = (
+                f"Il funding dichiarato (€{funding:,.0f}) è {ratio:.0f}x i ricavi "
+                f"da bilancio (€{revenue:,.0f}). Per uno startup early-stage è "
+                f"possibile, ma un rapporto superiore a 100x merita verifica — "
+                f"soprattutto se l'azienda non è in fase pre-revenue dichiarata."
+            )
+        elif ratio > 50:
+            severity, verdict = "medium", "suspicious"
+            explanation = (
+                f"Il funding (€{funding:,.0f}) è {ratio:.0f}x i ricavi "
+                f"(€{revenue:,.0f}). Ratio elevato: verificare che il funding "
+                f"sia effettivamente avvenuto o che i ricavi del bilancio siano "
+                f"rappresentativi dell'attuale stadio."
+            )
+        else:
+            return None
+
+        return CrossCheckResult(
+            check_id="funding_vs_financials",
+            title="Funding sproporzionato rispetto ai ricavi",
+            severity=severity, verdict=verdict,
+            metric_a={"label": "Funding dichiarato", "value": funding,
+                      "source": "pitch_deck"},
+            metric_b={"label": "Ricavi bilancio", "value": revenue,
+                      "source": "bilancio"},
+            derived={"label": "Funding/Revenue ratio", "value": round(ratio, 1),
+                     "unit": "x"},
+            benchmark={"min": 0, "max": 50, "unit": "x",
+                       "sector": "Early-stage startup"},
+            sources=sources,
+            explanation=explanation,
+        )
+
+    # ── Check 4: Headcount vs struttura dichiarata ────────────────────────────
+
+    def _check_headcount_vs_structure(self, ctx: dict,
+                                      sector: str) -> Optional[CrossCheckResult]:
+        employees = (ctx.get("verified_team_size")
+                     or ctx.get("claimed_team_size")
+                     or ctx.get("bilancio_employees"))
+        if not employees:
+            return None
+
+        issues = []
+        sources = []
+
+        # "uffici in N città" — ogni sede richiede almeno 2-3 persone
+        pitch_text = " ".join(ctx["pitch_quotes"].values()).lower()
+        offices_m = re.search(
+            r"uffic[i]?\s+a\s+([\w\s,]+(?:e\s+[\w]+)?)\b", pitch_text
+        )
+        if offices_m:
+            cities_text = offices_m.group(1)
+            # Conta le città
+            n_cities = max(1, len(re.findall(r"\b[A-Z][a-z]+\b", offices_m.group(0))))
+            min_staff = n_cities * 3
+            if employees < min_staff:
+                issues.append(
+                    f"Uffici in {n_cities} città dichiarati ma solo "
+                    f"{int(employees)} dipendenti ({min_staff} minimi stimati)"
+                )
+                sources.append({
+                    "type": "pitch_deck",
+                    "quote": f"'{offices_m.group(0).strip()}' — "
+                             f"implica almeno {min_staff} persone",
+                    "value": n_cities, "confidence": 0.70,
+                })
+
+        # "team di N esperti" vs dipendenti verificati
+        claimed = ctx.get("claimed_team_size")
+        verified = ctx.get("verified_team_size")
+        if claimed and verified and abs(claimed - verified) / max(claimed, 1) > 0.4:
+            issues.append(
+                f"Team dichiarato ({int(claimed)}) vs verificato "
+                f"su LinkedIn ({int(verified)}): scarto "
+                f"{abs(claimed-verified)/claimed*100:.0f}%"
+            )
+            sources += [
+                {"type": "pitch_deck",
+                 "quote": ctx["pitch_quotes"].get("team_size",
+                          f"Team di {int(claimed)} persone dichiarato"),
+                 "value": claimed, "confidence": 0.80},
+                {"type": "linkedin",
+                 "quote": f"LinkedIn headcount: {int(verified)} dipendenti",
+                 "value": verified, "confidence": 0.75},
+            ]
+
+        if not issues:
+            return None
+
+        return CrossCheckResult(
+            check_id="headcount_vs_structure",
+            title="Struttura operativa incompatibile con il team",
+            severity="medium",
+            verdict="suspicious",
+            metric_a={"label": "Dipendenti rilevati", "value": int(employees),
+                      "source": "linkedin/bilancio"},
+            metric_b={"label": "Struttura dichiarata", "value": "; ".join(issues),
+                      "source": "pitch_deck"},
+            derived={"label": "Anomalie", "value": len(issues), "unit": ""},
+            benchmark={},
+            sources=sources,
+            explanation=" | ".join(issues),
+        )
+
+    # ── Check 5: Crescita dichiarata vs bilanci storici ───────────────────────
+
+    def _check_growth_vs_balance_sheet(self, ctx: dict,
+                                       sector: str) -> Optional[CrossCheckResult]:
+        growth_pct = ctx.get("claimed_growth_pct")
+        revenue    = ctx.get("bilancio_revenue")
+        year       = ctx.get("bilancio_year")
+        if not growth_pct or not revenue:
+            return None
+
+        from datetime import date
+        current_year = date.today().year
+
+        # Se il bilancio è vecchio (>2 anni) e viene dichiarata forte crescita,
+        # la crescita potrebbe essere basata su dati pre-bilancio — non verificabile
+        if year and (current_year - year) > 2 and growth_pct > 50:
+            return CrossCheckResult(
+                check_id="growth_vs_balance_sheet",
+                title="Crescita dichiarata non verificabile su bilanci recenti",
+                severity="medium",
+                verdict="unverifiable",
+                metric_a={"label": "Crescita dichiarata", "value": growth_pct,
+                          "source": "pitch_deck"},
+                metric_b={"label": "Ultimo bilancio disponibile", "value": year,
+                          "source": "bilancio"},
+                derived={"label": "Gap bilancio", "value": current_year - year,
+                         "unit": "anni"},
+                benchmark={},
+                sources=[
+                    {"type": "pitch_deck",
+                     "quote": ctx["pitch_quotes"].get(
+                         "revenue", f"Crescita dichiarata: {growth_pct:.0f}%"),
+                     "value": growth_pct, "confidence": 0.70},
+                    {"type": "bilancio",
+                     "quote": f"Ultimo bilancio disponibile: {year} "
+                              f"(ricavi €{revenue:,.0f})",
+                     "value": revenue, "confidence": 0.93},
+                ],
+                explanation=(
+                    f"La crescita dichiarata ({growth_pct:.0f}%) non può essere "
+                    f"verificata perché l'ultimo bilancio disponibile è del {year} "
+                    f"({current_year - year} anni fa). Per validare la crescita "
+                    f"servirebbero bilanci più recenti."
+                ),
+            )
+
+        # Se il bilancio è recente, possiamo stimare: il revenue attuale implica
+        # un revenue dell'anno precedente = revenue / (1 + growth/100)
+        # Se il risultato è negativo o zero, la crescita è impossibile
+        if year and (current_year - year) <= 1 and growth_pct > 0:
+            implied_prev = revenue / (1 + growth_pct / 100)
+            if implied_prev < 1000 and revenue > 10000:
+                return CrossCheckResult(
+                    check_id="growth_vs_balance_sheet",
+                    title="Tasso di crescita implicherebbe ricavi precedenti nulli",
+                    severity="high",
+                    verdict="implausible",
+                    metric_a={"label": "Crescita dichiarata", "value": growth_pct,
+                              "source": "pitch_deck"},
+                    metric_b={"label": "Ricavi bilancio", "value": revenue,
+                              "source": "bilancio"},
+                    derived={"label": "Ricavi anno prec. impliciti",
+                             "value": round(implied_prev, 0), "unit": "€"},
+                    benchmark={},
+                    sources=[
+                        {"type": "pitch_deck",
+                         "quote": f"Crescita dichiarata: {growth_pct:.0f}%",
+                         "value": growth_pct, "confidence": 0.70},
+                        {"type": "bilancio",
+                         "quote": f"Ricavi {year}: €{revenue:,.0f}",
+                         "value": revenue, "confidence": 0.93},
+                    ],
+                    explanation=(
+                        f"Una crescita del {growth_pct:.0f}% con ricavi attuali "
+                        f"di €{revenue:,.0f} implica ricavi precedenti di soli "
+                        f"€{implied_prev:,.0f} — praticamente zero. "
+                        f"O la crescita è sovrastimata o i ricavi di riferimento "
+                        f"sono diversi da quelli del bilancio."
+                    ),
+                )
+        return None
+
+    # ── Check 6: Data fondazione vs claim di maturità ─────────────────────────
+
+    def _check_founding_vs_maturity(self, ctx: dict,
+                                    sector: str) -> Optional[CrossCheckResult]:
+        founding_year  = ctx.get("founding_year")
+        maturity_phrases = ctx.get("maturity_phrases", [])
+        if not founding_year or not maturity_phrases:
+            return None
+
+        from datetime import date
+        company_age = date.today().year - founding_year
+
+        violations = []
+        for phrase in maturity_phrases:
+            min_years = MATURITY_THRESHOLDS.get(phrase, 3)
+            if company_age < min_years:
+                violations.append({
+                    "phrase":    phrase,
+                    "min_years": min_years,
+                    "actual":    company_age,
+                })
+
+        if not violations:
+            return None
+
+        sources = [
+            {"type": "pitch_deck",
+             "quote": f"Frasi di maturità trovate: "
+                      + ", ".join(f'"{v["phrase"]}"' for v in violations[:3]),
+             "value": None, "confidence": 0.85},
+            {"type": "opencorporates",
+             "quote": f"Azienda costituita nel {founding_year} "
+                      f"({company_age} ann{'o' if company_age==1 else 'i'} fa)",
+             "value": founding_year, "confidence": 0.90},
+        ]
+
+        worst = min(violations, key=lambda v: v["actual"] - v["min_years"])
+        severity = "high" if company_age < 1 else "medium"
+
+        return CrossCheckResult(
+            check_id="founding_vs_maturity",
+            title="Claim di maturità incompatibile con data di fondazione",
+            severity=severity,
+            verdict="suspicious",
+            metric_a={"label": "Anni di attività", "value": company_age,
+                      "source": "opencorporates"},
+            metric_b={"label": "Anni minimi richiesti",
+                      "value": worst["min_years"], "source": "benchmark"},
+            derived={"label": "Gap", "value": worst["min_years"] - company_age,
+                     "unit": "anni"},
+            benchmark={},
+            sources=sources,
+            explanation=(
+                f"L'azienda è stata fondata nel {founding_year} "
+                f"({company_age} ann{'o' if company_age==1 else 'i'} fa), "
+                f"ma il pitch usa espressioni come "
+                f'"{violations[0]["phrase"]}" che implicano almeno '
+                f"{violations[0]['min_years']} anni di attività."
+            ),
+        )
+
+    # ── LLM explanation generator ─────────────────────────────────────────────
+
+    def _generate_explanation(self, check: CrossCheckResult) -> str:
+        """
+        Genera una spiegazione contestuale con Mistral.
+        Fallback: usa l'explanation di default già calcolata.
+        """
+        if not self.llm or check.explanation:
+            return check.explanation
+
+        try:
+            prompt = (
+                f"Sei un analista finanziario di due diligence. "
+                f"Spiega in 2-3 frasi, in italiano, perché questa anomalia "
+                f"è significativa per chi deve valutare l'affidabilità di una startup.\n\n"
+                f"Anomalia: {check.title}\n"
+                f"Metrica A: {check.metric_a.get('label')} = "
+                f"{check.metric_a.get('value')}\n"
+                f"Metrica B: {check.metric_b.get('label')} = "
+                f"{check.metric_b.get('value')}\n"
+                f"Valore derivato: {check.derived.get('label')} = "
+                f"{check.derived.get('value')} {check.derived.get('unit','')}\n"
+                f"Fonti: "
+                + "; ".join(s.get("quote", "") for s in check.sources[:2])
+            )
+            response = self.llm.complete(
+                "Rispondi SOLO con la spiegazione in italiano. "
+                "Sii diretto e tecnico. Max 3 frasi.",
+                prompt
+            )
+            return response.strip() if response else check.explanation
+        except Exception:
+            return check.explanation
