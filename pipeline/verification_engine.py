@@ -112,6 +112,7 @@ class VerificationResult:
     tech_stack: Optional[dict]        = None   # tecnologie sito web
     tone_analysis: Optional[dict]     = None   # analisi tono pitch deck
     coherence_issues: list[dict]      = field(default_factory=list)  # problemi coerenza dati
+    cross_checks: list[dict]          = field(default_factory=list)  # cross-metric consistency
 
     def summary(self) -> str:
         lines = [
@@ -149,6 +150,7 @@ class VerificationResult:
             "tech_stack":   self.tech_stack,
             "tone_analysis": self.tone_analysis,
             "coherence_issues": self.coherence_issues,
+            "cross_checks":     [c.to_dict() if hasattr(c,"to_dict") else c for c in self.cross_checks],
             "errors": self.errors,
         }
 
@@ -1297,6 +1299,24 @@ class VerificationEngine:
         # ── Calcola Trust Score ───────────────────────────────────────────
         result.trust_score = self._compute_trust_score(result.verdicts)
 
+        # ── Cross-metric consistency checks ─────────────────────────────────
+        try:
+            from cross_checks import CrossMetricChecker
+            checker = CrossMetricChecker(llm=getattr(self, "llm", None))
+            cross = checker.run(
+                extraction_result=getattr(self, "_last_extraction", None),
+                verification_result=result,
+                sector=sector,
+            )
+            result.cross_checks = [c.to_dict() for c in cross]
+            if cross:
+                log.info(
+                    f"CrossChecks: {len(cross)} anomalie — "
+                    f"{sum(1 for c in cross if c.severity in ('critical','high'))} critiche/alte"
+                )
+        except Exception as _ce:
+            log.debug(f"CrossMetricChecker: {_ce}")
+
         # ── Applica penalità per problemi di coerenza ─────────────────────
         if result.coherence_issues and result.trust_score >= 0:
             penalty = 0.0
@@ -1306,7 +1326,7 @@ class VerificationEngine:
                 if sev == "critical":
                     penalty += 3.0   # P.IVA sbagliata: -3 punti
                 elif t == "name_mismatch":
-                    penalty += 2.5   # Nome azienda diverso: -2.5
+                    penalty += 4.0   # Nome azienda diverso: -4 (possibile frode documentale)
                 elif t == "stale_balance_sheet":
                     penalty += 1.5   # Bilancio >5 anni: -1.5
                 elif sev == "warning":
