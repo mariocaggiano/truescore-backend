@@ -133,6 +133,20 @@ class CrossMetricChecker:
 
         # Dati di input aggregati
         ctx = self._build_context(extraction_result, verification_result)
+        # Parsa metriche dal testo grezzo del pitch (non solo dalle claim estratte)
+        raw_texts = []
+        for claim in getattr(extraction_result, 'claims', []):
+            raw_texts.append(getattr(claim, 'text', '') or '')
+        # Cerca anche nel testo completo dei documenti dichiarativi
+        for doc in getattr(extraction_result, '_raw_declarative_texts', []):
+            raw_texts.append(doc)
+        # Fallback: usa raw_excerpt dal bilancio se disponibile
+        fin = getattr(extraction_result, 'financial_data', None)
+        if fin:
+            raw_texts.append(getattr(fin, 'raw_excerpt', '') or '')
+        full_text = ' '.join(raw_texts)
+        if full_text:
+            self._parse_metrics_from_text(full_text, ctx)
         if not ctx:
             return []
 
@@ -157,6 +171,10 @@ class CrossMetricChecker:
             except Exception as e:
                 log.debug(f"CrossCheck {runner.__name__}: {e}")
 
+        # Log diagnostico: mostra cosa è stato estratto nel contesto
+        ctx_summary = {k: v for k, v in ctx.items()
+                       if v and k not in ("pitch_quotes", "maturity_phrases")}
+        log.info(f"CrossMetricChecker ctx: {ctx_summary}")
         log.info(
             f"CrossMetricChecker: {len(checks)} anomalie rilevate "
             f"({sum(1 for c in checks if c.severity=='critical')} critiche, "
