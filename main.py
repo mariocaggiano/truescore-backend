@@ -137,8 +137,8 @@ def _send_report_email(
         return False
 
     try:
-        # Leggi e codifica il PDF in base64
         import base64
+        import requests as req
         pdf_bytes = Path(pdf_path).read_bytes()
         pdf_b64   = base64.b64encode(pdf_bytes).decode("utf-8")
 
@@ -232,7 +232,7 @@ def _send_report_email(
             ],
         }
 
-        resp = requests.post(
+        resp = req.post(
             "https://api.resend.com/emails",
             headers={
                 "Authorization": f"Bearer {api_key}",
