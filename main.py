@@ -578,6 +578,12 @@ async def run_pipeline(
 
         engine = VerificationEngine()
         engine._last_extraction = extraction   # usato da CrossMetricChecker
+        # Passa il testo grezzo del pitch per i cross-check metrici
+        extraction._raw_declarative_texts = []
+        if pitch_text and not pitch_text.startswith('__PDF_PATH__:'):
+            extraction._raw_declarative_texts.append(pitch_text)
+        elif bilancio_text and not bilancio_text.startswith('__PDF_PATH__:'):
+            extraction._raw_declarative_texts.append(bilancio_text)
         verification = engine.verify(
             company_name=company_name,
             claims=extraction.claims,
