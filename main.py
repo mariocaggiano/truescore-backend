@@ -115,6 +115,148 @@ def _job_update(job_id: str, **kwargs):
         JOBS[job_id]["updated_at"] = time.time()
 
 
+# ─────────────────────────────────────────────
+#  Email via Resend
+# ─────────────────────────────────────────────
+
+def _send_report_email(
+    to_email: str,
+    company_name: str,
+    trust_score: float,
+    pdf_path: str,
+    job_id: str,
+) -> bool:
+    """
+    Invia il report PDF via Resend (resend.com).
+    Richiede env var RESEND_API_KEY.
+    Ritorna True se l'invio ha avuto successo.
+    """
+    api_key = os.getenv("RESEND_API_KEY", "")
+    if not api_key:
+        log.warning("RESEND_API_KEY non configurata — email non inviata")
+        return False
+
+    try:
+        # Leggi e codifica il PDF in base64
+        import base64
+        pdf_bytes = Path(pdf_path).read_bytes()
+        pdf_b64   = base64.b64encode(pdf_bytes).decode("utf-8")
+
+        # Score label
+        if trust_score < 0:
+            score_str = "N/D (dati insufficienti)"
+        elif trust_score < 4:
+            score_str = f"{trust_score:.1f}/10 — Bassa affidabilità"
+        elif trust_score < 6.5:
+            score_str = f"{trust_score:.1f}/10 — Affidabilità moderata"
+        else:
+            score_str = f"{trust_score:.1f}/10 — Alta affidabilità"
+
+        # Colore badge
+        badge_color = (
+            "#757575" if trust_score < 0 else
+            "#E53935" if trust_score < 4 else
+            "#F57C00" if trust_score < 6.5 else
+            "#43A047"
+        )
+
+        html_body = f"""
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background:#0d1117;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0d1117;padding:40px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0" style="background:#161b22;border-radius:12px;overflow:hidden;border:1px solid #30363d;">
+
+        <!-- Header -->
+        <tr><td style="background:#0d1117;padding:24px 32px;border-bottom:1px solid #30363d;">
+          <span style="font-family:Georgia,serif;font-size:22px;font-weight:700;color:#ffffff;">
+            <span style="color:#4f8ef7;">True</span>Score
+          </span>
+          <span style="font-size:11px;color:#8b949e;margin-left:12px;font-family:monospace;letter-spacing:0.08em;">INTELLIGENCE REPORT</span>
+        </td></tr>
+
+        <!-- Body -->
+        <tr><td style="padding:32px;">
+          <p style="color:#8b949e;font-size:13px;margin:0 0 8px;">Report di verifica per</p>
+          <h2 style="color:#ffffff;font-family:Georgia,serif;font-size:24px;margin:0 0 24px;">{company_name}</h2>
+
+          <!-- Score badge -->
+          <table cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
+            <tr>
+              <td style="background:{badge_color}22;border:1px solid {badge_color}66;border-radius:8px;padding:16px 24px;">
+                <div style="font-family:monospace;font-size:10px;color:#8b949e;letter-spacing:0.1em;margin-bottom:6px;">TRUST SCORE</div>
+                <div style="font-family:Georgia,serif;font-size:32px;font-weight:700;color:{badge_color};">{score_str}</div>
+              </td>
+            </tr>
+          </table>
+
+          <p style="color:#8b949e;font-size:13px;line-height:1.6;margin:0 0 24px;">
+            Il report completo è allegato a questa email in formato PDF.<br>
+            Include analisi delle claim, red flags, persone chiave e stato legale.
+          </p>
+
+          <div style="border-top:1px solid #30363d;padding-top:20px;margin-top:8px;">
+            <p style="color:#484f58;font-size:11px;font-family:monospace;margin:0;">
+              Report ID: {job_id[:8].upper()} · Generato il {__import__('datetime').datetime.utcnow().strftime('%d/%m/%Y %H:%M')} UTC
+            </p>
+          </div>
+        </td></tr>
+
+        <!-- Footer -->
+        <tr><td style="background:#0d1117;padding:16px 32px;border-top:1px solid #30363d;">
+          <p style="color:#484f58;font-size:11px;font-family:monospace;margin:0;">
+            TrueScore · Business Verification Intelligence · truescore.it
+          </p>
+        </td></tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>
+"""
+
+        payload = {
+            "from":    "TrueScore <report@truescore.it>",
+            "to":      [to_email],
+            "subject": f"TrueScore Report — {company_name} ({score_str.split('—')[0].strip()})",
+            "html":    html_body,
+            "attachments": [
+                {
+                    "filename":    f"TrueScore_{company_name.replace(' ','_')}_{job_id[:8]}.pdf",
+                    "content":     pdf_b64,
+                    "content_type": "application/pdf",
+                }
+            ],
+        }
+
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type":  "application/json",
+            },
+            json=payload,
+            timeout=15,
+        )
+
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            log.info(f"Email inviata a {to_email} — Resend ID: {data.get('id','?')}")
+            return True
+        else:
+            log.warning(f"Resend error {resp.status_code}: {resp.text[:200]}")
+            return False
+
+    except Exception as e:
+        log.warning(f"Email error: {e}")
+        return False
+
+
+
+
 def _check_coherence(company_name: str, vat_number: str,
                      financial_data) -> list[dict]:
     """
@@ -224,6 +366,7 @@ async def run_pipeline(
     ufficiocamerale_html: str = "",
     ufficiocamerale_url: str = "",
     opencorporates_html: str = "",
+    recipient_email: str = "",
 ):
     try:
         _job_update(job_id, status="running", started_at=time.time())
@@ -436,6 +579,17 @@ async def run_pipeline(
         log.info(f"[{job_id[:8]}] Pipeline completata — "
                  f"Trust Score: {verification.trust_score:.1f}/10")
 
+        # ── Email report se richiesto ──────────────────────────────────────
+        if recipient_email and pdf_path.exists():
+            sent = _send_report_email(
+                to_email=recipient_email,
+                company_name=company_name,
+                trust_score=verification.trust_score,
+                pdf_path=str(pdf_path),
+                job_id=job_id,
+            )
+            _job_update(job_id, email_sent=sent, email_to=recipient_email)
+
     except Exception as e:
         log.exception(f"[{job_id[:8]}] Errore pipeline: {e}")
         _job_update(job_id, status="error", error=str(e))
@@ -534,6 +688,7 @@ async def analyze(
     ufficiocamerale_html:     Optional[str]   = Form(None),
     ufficiocamerale_url:      Optional[str]   = Form(None),
     opencorporates_html:      Optional[str]   = Form(None),
+    recipient_email:          Optional[str]   = Form(None),
     pitch_file:               Optional[UploadFile] = File(None),
     bilancio_file:            Optional[UploadFile] = File(None),
 ):
@@ -591,6 +746,7 @@ async def analyze(
         linkedin_url or "", vat_number or "",
         ufficiocamerale_html or "", ufficiocamerale_url or "",
         opencorporates_html or "",
+        recipient_email or "",
     )
 
     log.info(f"[{job_id[:8]}] Analisi avviata per '{company_name}'")
