@@ -75,6 +75,78 @@ SHARES_DIR  = Path(tempfile.gettempdir()) / "truescore_shares"
 SHARES_DIR.mkdir(exist_ok=True)
 SHARE_TTL_HOURS = 72   # link valido 72 ore
 
+# ─────────────────────────────────────────────
+#  Supabase — storico analisi
+# ─────────────────────────────────────────────
+
+def _supabase_save(record: dict) -> bool:
+    """
+    Salva un'analisi completata nella tabella truescore_history su Supabase.
+    Richiede env var SUPABASE_URL e SUPABASE_ANON_KEY.
+    """
+    url = os.getenv("SUPABASE_URL", "")
+    key = os.getenv("SUPABASE_ANON_KEY", "")
+    if not url or not key:
+        log.debug("Supabase non configurato — storico non salvato")
+        return False
+    try:
+        import requests as req
+        resp = req.post(
+            f"{url}/rest/v1/truescore_history",
+            headers={
+                "apikey":        key,
+                "Authorization": f"Bearer {key}",
+                "Content-Type":  "application/json",
+                "Prefer":        "return=minimal",
+            },
+            json=record,
+            timeout=8,
+        )
+        if resp.status_code in (200, 201):
+            log.info(f"Supabase: salvata analisi per '{record.get('company_name')}'")
+            return True
+        log.warning(f"Supabase save error {resp.status_code}: {resp.text[:150]}")
+        return False
+    except Exception as e:
+        log.warning(f"Supabase save exception: {e}")
+        return False
+
+
+def _supabase_history(company_name: str, vat_number: str = "") -> list:
+    """
+    Recupera lo storico analisi per un'azienda da Supabase.
+    Cerca per nome azienda (case-insensitive) o P.IVA se fornita.
+    """
+    url = os.getenv("SUPABASE_URL", "")
+    key = os.getenv("SUPABASE_ANON_KEY", "")
+    if not url or not key:
+        return []
+    try:
+        import requests as req
+        # Cerca per P.IVA prima (più preciso), poi per nome
+        if vat_number:
+            params = f"vat_number=eq.{vat_number}&order=analyzed_at.desc&limit=20"
+        else:
+            name_encoded = company_name.lower().replace(" ", "%20")
+            params = f"company_name_lower=ilike.*{name_encoded}*&order=analyzed_at.desc&limit=20"
+
+        resp = req.get(
+            f"{url}/rest/v1/truescore_history?{params}",
+            headers={
+                "apikey":        key,
+                "Authorization": f"Bearer {key}",
+            },
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        return []
+    except Exception as e:
+        log.debug(f"Supabase history exception: {e}")
+        return []
+
+
+
 
 # ─────────────────────────────────────────────
 #  Helpers
@@ -218,8 +290,14 @@ def _send_report_email(
 </html>
 """
 
+        from_address = (
+            "TrueScore <report@truescore.it>"
+            if os.getenv("RESEND_DOMAIN_VERIFIED", "").lower() == "true"
+            else "TrueScore <onboarding@resend.dev>"
+        )
+
         payload = {
-            "from":    "TrueScore <report@truescore.it>",
+            "from":    from_address,
             "to":      [to_email],
             "subject": f"TrueScore Report — {company_name} ({score_str.split('—')[0].strip()})",
             "html":    html_body,
@@ -579,6 +657,27 @@ async def run_pipeline(
         log.info(f"[{job_id[:8]}] Pipeline completata — "
                  f"Trust Score: {verification.trust_score:.1f}/10")
 
+        # ── Salva storico su Supabase ──────────────────────────────────────
+        import datetime as _dt
+        _supabase_save({
+            "job_id":            job_id,
+            "company_name":      company_name,
+            "company_name_lower": company_name.lower(),
+            "vat_number":        vat_number or None,
+            "trust_score":       verification.trust_score
+                                 if verification.trust_score >= 0 else None,
+            "trust_score_label": verification.trust_score_label,
+            "tone_score":        (verification.tone_analysis or {}).get("tone_score"),
+            "verdicts_count":    len(verification.verdicts),
+            "discrepancies":     sum(
+                1 for v in verification.verdicts
+                if getattr(v.verdict, "value", str(v.verdict)) == "discrepancy"
+            ),
+            "coherence_issues":  len(coherence_issues),
+            "sector":            sector or "",
+            "analyzed_at":       _dt.datetime.utcnow().isoformat(),
+        })
+
         # ── Email report se richiesto ──────────────────────────────────────
         if recipient_email and pdf_path.exists():
             sent = _send_report_email(
@@ -602,6 +701,18 @@ async def run_pipeline(
 @app.get("/health")
 def health():
     return {"status": "ok", "version": "0.1.0"}
+
+
+@app.get("/api/history/{company_name}")
+def get_history(company_name: str, vat_number: str = ""):
+    """
+    Storico analisi per un'azienda.
+    Restituisce le ultime 20 analisi ordinate per data decrescente.
+    """
+    records = _supabase_history(company_name, vat_number)
+    return {"company_name": company_name, "records": records, "count": len(records)}
+
+
 
 
 # ─────────────────────────────────────────────
