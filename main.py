@@ -91,6 +91,7 @@ def _supabase_save(record: dict) -> bool:
         return False
     try:
         import requests as req
+        # Supporta sia il formato legacy (eyJ...) che il nuovo (sb_secret_...)
         resp = req.post(
             f"{url}/rest/v1/truescore_history",
             headers={
@@ -576,6 +577,7 @@ async def run_pipeline(
         await asyncio.sleep(0.1)
 
         engine = VerificationEngine()
+        engine._last_extraction = extraction   # usato da CrossMetricChecker
         verification = engine.verify(
             company_name=company_name,
             claims=extraction.claims,
@@ -641,6 +643,7 @@ async def run_pipeline(
             "tech_stack":   verification.tech_stack,
             "tone_analysis": verification.tone_analysis,
             "coherence_issues": verification.coherence_issues,
+            "cross_checks":     verification.cross_checks,
             "pdf_ready":    True,
             "report_id":    config.report_id,
             "generated_at": config.generated_at,
