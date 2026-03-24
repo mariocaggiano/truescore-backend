@@ -75,6 +75,41 @@ SHARES_DIR  = Path(tempfile.gettempdir()) / "truescore_shares"
 SHARES_DIR.mkdir(exist_ok=True)
 SHARE_TTL_HOURS = 72   # link valido 72 ore
 
+# ── Rate limiter in-memory ──────────────────────────────────────────────────
+RATE_LIMIT_WINDOW = 3600   # 1 ora
+RATE_LIMIT_MAX    = 5      # max 5 analisi/ora per IP
+_rate_limit: dict[str, list[float]] = {}
+
+def _check_rate_limit(client_ip: str) -> bool:
+    """Ritorna True se entro i limiti, False se da bloccare."""
+    now  = time.time()
+    hits = [t for t in _rate_limit.get(client_ip, []) if now - t < RATE_LIMIT_WINDOW]
+    if len(hits) >= RATE_LIMIT_MAX:
+        _rate_limit[client_ip] = hits
+        return False
+    hits.append(now)
+    _rate_limit[client_ip] = hits
+    return True
+
+# ─────────────────────────────────────────────
+# Startup: avvia cleanup job in background
+# ─────────────────────────────────────────────
+
+async def _cleanup_old_jobs():
+    """Rimuove job più vecchi di 1 ora ogni 30 min (evita memory leak su free tier)."""
+    while True:
+        await asyncio.sleep(1800)  # ogni 30 min
+        now = time.time()
+        to_del = [jid for jid, j in list(JOBS.items()) if now - j.get("created_at", 0) > 3600]
+        for jid in to_del:
+            JOBS.pop(jid, None)
+        if to_del:
+            log.info(f"Cleanup: rimossi {len(to_del)} job scaduti")
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(_cleanup_old_jobs())
+
 # ─────────────────────────────────────────────
 #  Supabase — storico analisi
 # ─────────────────────────────────────────────
@@ -701,6 +736,14 @@ async def run_pipeline(
     except Exception as e:
         log.exception(f"[{job_id[:8]}] Errore pipeline: {e}")
         _job_update(job_id, status="error", error=str(e))
+    finally:
+        # Rimuovi i file temporanei dell'upload
+        for _f in _tmp_files:
+            try:
+                os.unlink(_f)
+                log.debug(f"Temp file rimosso: {_f}")
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────
@@ -820,9 +863,23 @@ async def analyze(
     if not company_name.strip():
         raise HTTPException(400, "company_name obbligatorio")
 
+    # Rate limiting per IP
+    client_ip = (
+        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
+    if not _check_rate_limit(client_ip):
+        raise HTTPException(
+            429,
+            f"Troppe richieste. Limite: {RATE_LIMIT_MAX} analisi/ora per IP. Riprova tra qualche minuto."
+        )
+
     # Leggi contenuto file se forniti
+    MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
     if pitch_file:
         raw = await pitch_file.read()
+        if len(raw) > MAX_UPLOAD_SIZE:
+            raise HTTPException(413, "Pitch deck troppo grande. Limite: 10 MB")
         fname = (pitch_file.filename or "").lower()
         if fname.endswith(".pdf"):
             # Salva su disco e lascia che pdfplumber lo legga correttamente
@@ -836,6 +893,8 @@ async def analyze(
 
     if bilancio_file:
         raw = await bilancio_file.read()
+        if len(raw) > MAX_UPLOAD_SIZE:
+            raise HTTPException(413, "Bilancio troppo grande. Limite: 10 MB")
         fname = (bilancio_file.filename or "").lower()
         if fname.endswith(".pdf"):
             import tempfile
@@ -893,7 +952,7 @@ def status(job_id: str):
 
 
 @app.get("/api/status/{job_id}/stream")
-async def status_stream(job_id: str):
+async def status_stream(job_id: str, request: Request):
     """
     Server-Sent Events: emette aggiornamenti di stato fino al completamento.
     Il frontend si connette qui per l'animazione della pipeline in tempo reale.
@@ -904,6 +963,9 @@ async def status_stream(job_id: str):
     async def event_generator():
         last_update = 0.0
         for _ in range(300):   # max 5 minuti (300 × 1s)
+            if await request.is_disconnected():
+                log.debug(f"[{job_id[:8]}] SSE: client disconnesso, stop stream")
+                break
             job = JOBS.get(job_id, {})
             updated = job.get("updated_at", 0)
 
@@ -1130,7 +1192,9 @@ async def debug_parse_document(
 
 @app.get("/test-llm")
 def test_llm():
-    """Testa il LLM configurato. Visita /test-llm per verificare."""
+    """Testa il LLM configurato. Solo in modalità DEBUG."""
+    if os.getenv("DEBUG", "false").lower() != "true":
+        raise HTTPException(403, "Endpoint disponibile solo in modalità debug. Imposta DEBUG=true nel .env.")
     import requests as req
 
     # Mistral
