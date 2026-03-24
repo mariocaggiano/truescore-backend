@@ -839,7 +839,8 @@ async def get_share(token: str):
 
 @app.post("/api/analyze")
 async def analyze(
-    background_tasks: BackgroundTasks,
+    request:            Request,
+    background_tasks:   BackgroundTasks,
     company_name:       str             = Form(...),
     pitch_text:         Optional[str]   = Form(None),
     bilancio_text:      Optional[str]   = Form(None),
