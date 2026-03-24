@@ -826,7 +826,7 @@ async def analyze(
         fname = (pitch_file.filename or "").lower()
         if fname.endswith(".pdf"):
             # Salva su disco e lascia che pdfplumber lo legga correttamente
-            import tempfile, os
+            import tempfile
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
                 tmp.write(raw)
                 _pitch_tmp = tmp.name
@@ -838,7 +838,7 @@ async def analyze(
         raw = await bilancio_file.read()
         fname = (bilancio_file.filename or "").lower()
         if fname.endswith(".pdf"):
-            import tempfile, os
+            import tempfile
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
                 tmp.write(raw)
                 _bilancio_tmp = tmp.name
@@ -1080,7 +1080,7 @@ async def debug_parse_document(
     if os.getenv("DEBUG", "false").lower() != "true":
         raise HTTPException(403, "Endpoint disponibile solo in modalità debug. Imposta DEBUG=true nel .env.")
 
-    import tempfile, os
+    import tempfile
     from pathlib import Path
 
     raw = await file.read()
