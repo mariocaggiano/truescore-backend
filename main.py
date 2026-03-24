@@ -61,7 +61,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # in produzione: limita al dominio Vercel
+    allow_origins=os.getenv("ALLOWED_ORIGINS", "https://truescore-frontend.vercel.app").split(","),  # configura ALLOWED_ORIGINS in .env per altri domini
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1026,97 +1026,6 @@ async def proxy_fetch(
         }
     except Exception as e:
         raise HTTPException(502, f"Fetch fallito: {e}")
-
-
-@app.post("/api/parse/ufficiocamerale")
-async def parse_ufficiocamerale(
-    html:        str = Form(...),
-    page_url:    str = Form(...),
-    vat_number:  str = Form(...),
-):
-    """Parsa HTML di ufficiocamerale.it pre-fetchato."""
-    from data_collector import UfficioCameraleConnector, InMemoryCache
-    connector = UfficioCameraleConnector(cache=InMemoryCache())
-    data = connector.parse_html(html, page_url, vat_number)
-    if data:
-        return {"found": True, "data": data}
-    return {"found": False, "data": None}
-
-
-@app.post("/api/parse/opencorporates")
-async def parse_opencorporates(
-    html:         str = Form(...),
-    page_url:     str = Form(...),
-    company_name: str = Form(...),
-):
-    """Parsa HTML di opencorporates.com pre-fetchato."""
-    from data_collector import OpenCorporatesConnector, InMemoryCache
-    connector = OpenCorporatesConnector(cache=InMemoryCache())
-    data = connector.parse_html(html, page_url)
-    if data:
-        return {"found": True, "data": data}
-    return {"found": False, "data": None}
-
-
-
-@app.post("/api/debug/parse-document")
-async def debug_parse_document(
-    file: UploadFile = File(...),
-    doc_type: str = Form("bilancio"),
-):
-    """
-    DEBUG: mostra il testo estratto da un PDF + risultati regex finanziaria.
-    Utile per capire perché ricavi=None.
-    Endpoint temporaneo — rimuovere in produzione.
-    """
-    import tempfile, os
-    from pathlib import Path
-
-    raw = await file.read()
-    suffix = Path(file.filename).suffix.lower()
-
-    # Scrivi in temp file
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(raw)
-        tmp_path = tmp.name
-
-    try:
-        from extractor import DocumentIngester, ClaimExtractor
-
-        if suffix == ".pdf":
-            text, method = DocumentIngester.from_pdf(tmp_path)
-        else:
-            text = raw.decode("utf-8", errors="replace")
-            method = "text"
-
-        # Mostra prime 3000 chars del testo estratto
-        excerpt = text[:3000]
-
-        # Prova regex
-        regex_result = ClaimExtractor._extract_financials_regex(text)
-
-        # Trova la sezione più rilevante
-        eco_markers = ["conto economico", "ricavi", "valore della produzione",
-                       "proventi", "fatturato", "a) ricavi"]
-        text_lower = text.lower()
-        found_markers = {}
-        for marker in eco_markers:
-            idx = text_lower.find(marker)
-            if idx > 0:
-                found_markers[marker] = text[max(0,idx-50):idx+200]
-
-        return {
-            "filename":       file.filename,
-            "extraction_method": method,
-            "total_chars":    len(text),
-            "text_excerpt":   excerpt,
-            "regex_result":   regex_result,
-            "markers_found":  found_markers,
-            "first_500_chars": text[:500],
-        }
-    finally:
-        os.unlink(tmp_path)
-
 # ─────────────────────────────────────────────
 #  Endpoint di diagnostica
 # ─────────────────────────────────────────────
@@ -1168,6 +1077,9 @@ async def debug_parse_document(
     Utile per capire perché ricavi=None.
     Endpoint temporaneo — rimuovere in produzione.
     """
+    if os.getenv("DEBUG", "false").lower() != "true":
+        raise HTTPException(403, "Endpoint disponibile solo in modalità debug. Imposta DEBUG=true nel .env.")
+
     import tempfile, os
     from pathlib import Path
 
@@ -1215,10 +1127,6 @@ async def debug_parse_document(
         }
     finally:
         os.unlink(tmp_path)
-
-# ─────────────────────────────────────────────
-#  Endpoint di diagnostica
-# ─────────────────────────────────────────────
 
 @app.get("/test-llm")
 def test_llm():
